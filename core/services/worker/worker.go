@@ -68,6 +68,24 @@ func Run(ctx *cliContext.Context, cfg *Config) error {
 		xlog.Warn("invalid heartbeat interval, using default 10s", "input", cfg.HeartbeatInterval, "error", err)
 	}
 	heartbeatInterval = cmp.Or(heartbeatInterval, 10*time.Second)
+
+	readinessTimeout, err := time.ParseDuration(cfg.BackendReadinessTimeout)
+	if err != nil && cfg.BackendReadinessTimeout != "" {
+		xlog.Warn("invalid backend readiness timeout, using default 30s", "input", cfg.BackendReadinessTimeout, "error", err)
+	}
+	readinessTimeout = cmp.Or(readinessTimeout, 30*time.Second)
+
+	readinessPollInterval, err := time.ParseDuration(cfg.BackendReadinessPollInterval)
+	if err != nil && cfg.BackendReadinessPollInterval != "" {
+		xlog.Warn("invalid backend readiness poll interval, using default 200ms", "input", cfg.BackendReadinessPollInterval, "error", err)
+	}
+	readinessPollInterval = cmp.Or(readinessPollInterval, 200*time.Millisecond)
+
+	readinessProbeTimeout, err := time.ParseDuration(cfg.BackendReadinessProbeTimeout)
+	if err != nil && cfg.BackendReadinessProbeTimeout != "" {
+		xlog.Warn("invalid backend readiness probe timeout, using default 2s", "input", cfg.BackendReadinessProbeTimeout, "error", err)
+	}
+	readinessProbeTimeout = cmp.Or(readinessProbeTimeout, 2*time.Second)
 	// Context cancelled on shutdown — used by heartbeat and other background goroutines
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	defer shutdownCancel()
@@ -123,15 +141,18 @@ func Run(ctx *cliContext.Context, cfg *Config) error {
 	}
 
 	supervisor := &backendSupervisor{
-		cfg:         cfg,
-		ml:          ml,
-		systemState: systemState,
-		galleries:   galleries,
-		nodeID:      nodeID,
-		nats:        natsClient,
-		sigCh:       sigCh,
-		processes:   make(map[string]*backendProcess),
-		nextPort:    basePort,
+		cfg:                   cfg,
+		ml:                    ml,
+		systemState:           systemState,
+		galleries:             galleries,
+		nodeID:                nodeID,
+		nats:                  natsClient,
+		sigCh:                 sigCh,
+		readinessTimeout:      readinessTimeout,
+		readinessPollInterval: readinessPollInterval,
+		readinessProbeTimeout: readinessProbeTimeout,
+		processes:             make(map[string]*backendProcess),
+		nextPort:              basePort,
 	}
 	supervisor.subscribeLifecycleEvents()
 

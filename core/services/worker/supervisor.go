@@ -39,6 +39,12 @@ type backendSupervisor struct {
 	nats        messaging.MessagingClient
 	sigCh       chan<- os.Signal // send shutdown signal instead of os.Exit
 
+	// Readiness tuning, parsed once at construction from cfg.BackendReadiness*.
+	// See Config for rationale.
+	readinessTimeout      time.Duration
+	readinessPollInterval time.Duration
+	readinessProbeTimeout time.Duration
+
 	mu        sync.Mutex
 	processes map[string]*backendProcess // key: backend name
 	nextPort  int                        // next available port for new backends
@@ -104,16 +110,14 @@ func (s *backendSupervisor) startBackend(backend, backendPath string) (string, e
 	// can take 10-15s before the gRPC port accepts connections; the previous
 	// 4s window made the worker reply Success on a not-yet-listening port,
 	// which manifested upstream as "connect: connection refused" on the
-	// frontend's first LoadModel dial.
+	// frontend's first LoadModel dial. Python backends loaded from NFS
+	// /backends can exceed 30s on cold start — see LOCALAI_BACKEND_READINESS_*
+	// env vars to extend the deadline without recompiling.
 	client := grpc.NewClientWithToken(clientAddr, false, nil, false, s.cfg.RegistrationToken)
-	const (
-		readinessPollInterval = 200 * time.Millisecond
-		readinessTimeout      = 30 * time.Second
-	)
-	deadline := time.Now().Add(readinessTimeout)
+	deadline := time.Now().Add(s.readinessTimeout)
 	for time.Now().Before(deadline) {
-		time.Sleep(readinessPollInterval)
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		time.Sleep(s.readinessPollInterval)
+		ctx, cancel := context.WithTimeout(context.Background(), s.readinessProbeTimeout)
 		if ok, _ := client.HealthCheck(ctx); ok {
 			cancel()
 			// Verify the process wasn't stopped/replaced while health-checking
@@ -146,7 +150,7 @@ func (s *backendSupervisor) startBackend(backend, backendPath string) (string, e
 	// real cause). Stop the half-started process, recycle the port, and
 	// surface the failure to the caller with the backend's stderr tail.
 	stderrTail := readLastLinesFromFile(proc.StderrPath(), 20)
-	xlog.Error("Backend gRPC server not ready before deadline; aborting install", "backend", backend, "addr", clientAddr, "timeout", readinessTimeout, "stderr", stderrTail)
+	xlog.Error("Backend gRPC server not ready before deadline; aborting install", "backend", backend, "addr", clientAddr, "timeout", s.readinessTimeout, "stderr", stderrTail)
 	if killErr := proc.Stop(); killErr != nil {
 		xlog.Warn("Failed to stop unready backend process", "backend", backend, "error", killErr)
 	}
@@ -156,7 +160,7 @@ func (s *backendSupervisor) startBackend(backend, backendPath string) (string, e
 		s.freePorts = append(s.freePorts, port)
 	}
 	s.mu.Unlock()
-	return "", fmt.Errorf("backend %s did not become ready within %s. Last stderr:\n%s", backend, readinessTimeout, stderrTail)
+	return "", fmt.Errorf("backend %s did not become ready within %s. Last stderr:\n%s", backend, s.readinessTimeout, stderrTail)
 }
 
 // resolveProcessKeys turns a caller-supplied identifier into the set of

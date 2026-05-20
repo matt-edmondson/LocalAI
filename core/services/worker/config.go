@@ -48,6 +48,17 @@ type Config struct {
 	// the existing label selector.
 	MaxReplicasPerModel int `env:"LOCALAI_MAX_REPLICAS_PER_MODEL" default:"1" help:"Max replicas of any single model on this worker. Default 1 preserves single-replica behavior; set higher to allow stacking replicas on a fat node." group:"registration"`
 
+	// Backend readiness tuning. The supervisor spawns a backend process, then
+	// polls gRPC HealthCheck until ready. Python backends (diffusers,
+	// transformers, vllm) typically need 60-180s on first cold start due to
+	// torch + CUDA driver init, multi-GB cuDNN/cuBLAS loads, and Python import
+	// time — especially when /backends is on NFS. The 30s default preserves
+	// prior behavior; raise via env var on slow-storage / cold-GPU nodes
+	// rather than recompiling.
+	BackendReadinessTimeout      string `env:"LOCALAI_BACKEND_READINESS_TIMEOUT" default:"30s" help:"Max time to wait for a freshly-spawned backend process to respond to gRPC HealthCheck before declaring install failed." group:"backends"`
+	BackendReadinessPollInterval string `env:"LOCALAI_BACKEND_READINESS_POLL_INTERVAL" default:"200ms" help:"How often to probe the backend's gRPC HealthCheck while waiting for readiness." group:"backends" hidden:""`
+	BackendReadinessProbeTimeout string `env:"LOCALAI_BACKEND_READINESS_PROBE_TIMEOUT" default:"2s" help:"Per-HealthCheck gRPC dial+call timeout while polling for readiness. Raise on heavily-loaded nodes." group:"backends" hidden:""`
+
 	// NATS (required)
 	NatsURL string `env:"LOCALAI_NATS_URL" required:"" help:"NATS server URL" group:"distributed"`
 
