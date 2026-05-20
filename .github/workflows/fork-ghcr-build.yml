@@ -1,0 +1,87 @@
+name: 'fork: build + push to GHCR'
+
+# Manual trigger for fork builds. Runs the same image builds as upstream
+# image-pr.yml but pushes to ghcr.io/<owner>/localai using GITHUB_TOKEN —
+# no DockerHub or quay credentials required.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (e.g. v4.2.4-shared-models-fs)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: 'cpu'
+            tag-suffix: ''
+            build-type: ''
+            cuda-major-version: ''
+            cuda-minor-version: ''
+            base-image: 'ubuntu:24.04'
+            ubuntu-version: '2404'
+          - variant: 'cuda13'
+            tag-suffix: '-gpu-nvidia-cuda-13'
+            build-type: 'cublas'
+            cuda-major-version: '13'
+            cuda-minor-version: '0'
+            base-image: 'ubuntu:22.04'
+            ubuntu-version: '2404'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Free disk space
+        uses: ./.github/actions/free-disk-space
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@master
+        with:
+          platforms: linux/amd64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@master
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            BUILD_TYPE=${{ matrix.build-type }}
+            CUDA_MAJOR_VERSION=${{ matrix.cuda-major-version }}
+            CUDA_MINOR_VERSION=${{ matrix.cuda-minor-version }}
+            BASE_IMAGE=${{ matrix.base-image }}
+            MAKEFLAGS=--jobs=3 --output-sync=target
+            SKIP_DRIVERS=false
+            UBUNTU_VERSION=${{ matrix.ubuntu-version }}
+          # GitHub Actions cache survives across runs of this workflow and
+          # is scoped per-variant so the CPU and GPU legs don't trash each
+          # other's layers.
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,scope=${{ matrix.variant }},mode=max
+          # provenance=false matches upstream image_build.yml — keeps the
+          # manifest-list digest deterministic.
+          provenance: false
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/localai:${{ inputs.tag }}${{ matrix.tag-suffix }}
