@@ -905,6 +905,62 @@ var _ = Describe("SmartRouter", func() {
 			Expect(original.ModelFile).To(Equal(origModelFile))
 			Expect(original.MMProj).To(Equal(origMMProj))
 		})
+
+		Context("when SharedModelsFilesystem is enabled", func() {
+			It("skips EnsureRemote entirely and passes paths through unchanged", func() {
+				stager := &fakeFileStager{}
+				router := NewSmartRouter(registry, SmartRouterOptions{
+					FileStager:             stager,
+					DB:                     db,
+					SharedModelsFilesystem: true,
+				})
+
+				node := &BackendNode{
+					ID:      "shared-node-id",
+					Name:    "shared-node",
+					Address: "10.0.0.201:50051",
+				}
+
+				original := &pb.ModelOptions{
+					Model:     "test-backend/models/test.gguf",
+					ModelFile: "/models/test-backend/models/test.gguf",
+					MMProj:    "/models/test-backend/models/mmproj.gguf",
+				}
+
+				staged, err := router.stageModelFiles(context.Background(), node, original, "test-model")
+				Expect(err).ToNot(HaveOccurred())
+
+				// No staging calls should have been made.
+				Expect(stager.ensureCalls).To(BeEmpty())
+
+				// Paths passed through unchanged so the worker reads them
+				// from the shared filesystem directly.
+				Expect(staged.ModelFile).To(Equal(original.ModelFile))
+				Expect(staged.MMProj).To(Equal(original.MMProj))
+
+				// ModelPath set so backends can resolve relative options
+				// (vae_path, etc.) against the shared models directory.
+				Expect(staged.ModelPath).To(Equal("/models"))
+			})
+
+			It("leaves ModelPath unset when ModelFile/Model can't derive frontendModelsDir", func() {
+				stager := &fakeFileStager{}
+				router := NewSmartRouter(registry, SmartRouterOptions{
+					FileStager:             stager,
+					DB:                     db,
+					SharedModelsFilesystem: true,
+				})
+
+				node := &BackendNode{ID: "n", Name: "n", Address: "x:1"}
+				// No ModelFile means the suffix-trim heuristic can't run.
+				original := &pb.ModelOptions{Model: "test-backend/models/test.gguf"}
+
+				staged, err := router.stageModelFiles(context.Background(), node, original, "test-model")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(stager.ensureCalls).To(BeEmpty())
+				Expect(staged.ModelPath).To(BeEmpty())
+			})
+		})
 	})
 
 	// -----------------------------------------------------------------------
