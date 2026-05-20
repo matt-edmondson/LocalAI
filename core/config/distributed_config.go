@@ -18,6 +18,14 @@ type DistributedConfig struct {
 	RegistrationToken string // --registration-token / LOCALAI_REGISTRATION_TOKEN (required token for node registration)
 	AutoApproveNodes  bool   // --auto-approve-nodes / LOCALAI_AUTO_APPROVE_NODES (skip admin approval for new workers)
 
+	// SharedModelsFilesystem asserts that every worker mounts the frontend's
+	// models directory at the same absolute path (e.g. a shared NFS PVC).
+	// When true, stageModelFiles skips uploading weight/config files and the
+	// worker resolves model paths directly from the shared filesystem.
+	// Per-request multimodal inputs and outputs are NOT affected — only
+	// files referenced from ModelOptions skip staging.
+	SharedModelsFilesystem bool // --distributed-shared-models-filesystem / LOCALAI_DISTRIBUTED_SHARED_MODELS_FILESYSTEM
+
 	// S3 configuration (used when StorageURL is set)
 	StorageBucket    string // --storage-bucket / LOCALAI_STORAGE_BUCKET
 	StorageRegion    string // --storage-region / LOCALAI_STORAGE_REGION
@@ -139,6 +147,12 @@ func WithStorageSecretKey(key string) AppOption {
 
 var EnableAutoApproveNodes = func(o *ApplicationConfig) {
 	o.Distributed.AutoApproveNodes = true
+}
+
+// EnableSharedModelsFilesystem opts the frontend into "all workers see the
+// same /models at the same path" mode. See DistributedConfig.SharedModelsFilesystem.
+var EnableSharedModelsFilesystem = func(o *ApplicationConfig) {
+	o.Distributed.SharedModelsFilesystem = true
 }
 
 // Defaults for distributed timeouts.

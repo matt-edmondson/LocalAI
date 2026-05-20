@@ -43,6 +43,11 @@ type SmartRouterOptions struct {
 	// anti-affinity is disabled at the scheduler layer; the per-node
 	// watchdog still enforces the rule on arrival.
 	ConflictResolver ConcurrencyConflictResolver
+	// SharedModelsFilesystem asserts that all workers see the same /models
+	// at the same absolute path as the frontend. When true, stageModelFiles
+	// short-circuits weight-file staging and leaves ModelFile/MMProj/etc.
+	// at their local absolute paths so the worker reads them directly.
+	SharedModelsFilesystem bool
 }
 
 // SmartRouter routes inference requests to the best available backend node.
@@ -56,6 +61,8 @@ type SmartRouter struct {
 	db               *gorm.DB             // for advisory locks during routing
 	stagingTracker   *StagingTracker      // tracks file staging progress for UI visibility
 	conflictResolver ConcurrencyConflictResolver
+	// sharedModelsFilesystem: see SmartRouterOptions.SharedModelsFilesystem.
+	sharedModelsFilesystem bool
 	// installFlight coalesces concurrent identical NATS install requests
 	// (same nodeID + backend + modelID + replica) so 6 simultaneous chat
 	// completions for one not-yet-loaded model produce ONE round-trip, not
@@ -70,15 +77,19 @@ func NewSmartRouter(registry ModelRouter, opts SmartRouterOptions) *SmartRouter 
 	if factory == nil {
 		factory = &tokenClientFactory{token: opts.AuthToken}
 	}
+	if opts.SharedModelsFilesystem {
+		xlog.Info("Shared models filesystem mode enabled — frontend will skip model-weight staging to workers")
+	}
 	return &SmartRouter{
-		registry:         registry,
-		unloader:         opts.Unloader,
-		fileStager:       opts.FileStager,
-		galleriesJSON:    opts.GalleriesJSON,
-		clientFactory:    factory,
-		db:               opts.DB,
-		stagingTracker:   NewStagingTracker(),
-		conflictResolver: opts.ConflictResolver,
+		registry:               registry,
+		unloader:               opts.Unloader,
+		fileStager:             opts.FileStager,
+		galleriesJSON:          opts.GalleriesJSON,
+		clientFactory:          factory,
+		db:                     opts.DB,
+		stagingTracker:         NewStagingTracker(),
+		conflictResolver:       opts.ConflictResolver,
+		sharedModelsFilesystem: opts.SharedModelsFilesystem,
 	}
 }
 
@@ -727,7 +738,6 @@ func (r *SmartRouter) buildClientForAddr(node *BackendNode, addr string, paralle
 // simply remove the {ModelsPath}/{trackingKey}/ directory.
 func (r *SmartRouter) stageModelFiles(ctx context.Context, node *BackendNode, opts *pb.ModelOptions, trackingKey string) (*pb.ModelOptions, error) {
 	opts = proto.Clone(opts).(*pb.ModelOptions)
-	xlog.Info("Staging model files for remote node", "node", node.Name, "modelFile", opts.ModelFile, "trackingKey", trackingKey)
 
 	// Derive the frontend models directory from ModelFile and Model.
 	// Example: ModelFile="/models/sd-cpp/models/flux.gguf", Model="sd-cpp/models/flux.gguf"
@@ -736,6 +746,27 @@ func (r *SmartRouter) stageModelFiles(ctx context.Context, node *BackendNode, op
 	if opts.ModelFile != "" && opts.Model != "" {
 		frontendModelsDir = filepath.Clean(strings.TrimSuffix(opts.ModelFile, opts.Model))
 	}
+
+	// Shared models filesystem: workers see the same /models at the same
+	// absolute path, so every file already referenced in opts (ModelFile,
+	// MMProj, LoraAdapter*, generic options like vae_path, etc.) is
+	// reachable on the worker as-is. Skip uploads entirely and just set
+	// ModelPath so backends resolve relative option paths correctly.
+	if r.sharedModelsFilesystem {
+		xlog.Debug("Skipping model file staging (shared filesystem mode)",
+			"node", node.Name, "modelFile", opts.ModelFile, "trackingKey", trackingKey)
+		if frontendModelsDir != "" {
+			opts.ModelPath = frontendModelsDir
+		}
+		// Surface "0 files / 0 transferred" in the staging UI rather than
+		// leaving the tracker silent — operators searching for a missing
+		// progress entry would otherwise wonder if scheduling stalled.
+		r.stagingTracker.Start(trackingKey, node.Name, 0)
+		r.stagingTracker.Complete(trackingKey)
+		return opts, nil
+	}
+
+	xlog.Info("Staging model files for remote node", "node", node.Name, "modelFile", opts.ModelFile, "trackingKey", trackingKey)
 
 	// keyMapper generates storage keys namespaced under trackingKey, preserving
 	// subdirectory structure relative to frontendModelsDir. This ensures:

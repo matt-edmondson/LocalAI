@@ -241,12 +241,13 @@ func initDistributed(cfg *config.ApplicationConfig, authDB *gorm.DB, configLoade
 		conflictResolver = configLoader
 	}
 	router := nodes.NewSmartRouter(registry, nodes.SmartRouterOptions{
-		Unloader:         remoteUnloader,
-		FileStager:       fileStager,
-		GalleriesJSON:    routerGalleriesJSON,
-		AuthToken:        routerAuthToken,
-		DB:               authDB,
-		ConflictResolver: conflictResolver,
+		Unloader:               remoteUnloader,
+		FileStager:             fileStager,
+		GalleriesJSON:          routerGalleriesJSON,
+		AuthToken:              routerAuthToken,
+		DB:                     authDB,
+		ConflictResolver:       conflictResolver,
+		SharedModelsFilesystem: cfg.Distributed.SharedModelsFilesystem,
 	})
 
 	// Create ReplicaReconciler for auto-scaling model replicas. Adapter +

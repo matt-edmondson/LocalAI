@@ -152,8 +152,9 @@ type RunCMD struct {
 	StorageRegion     string `env:"LOCALAI_STORAGE_REGION" default:"us-east-1" help:"S3 region" group:"distributed"`
 	StorageAccessKey  string `env:"LOCALAI_STORAGE_ACCESS_KEY" help:"S3 access key ID" group:"distributed"`
 	StorageSecretKey  string `env:"LOCALAI_STORAGE_SECRET_KEY" help:"S3 secret access key" group:"distributed"`
-	RegistrationToken string `env:"LOCALAI_REGISTRATION_TOKEN" help:"Token that backend nodes must provide to register (empty = no auth required)" group:"distributed"`
-	AutoApproveNodes  bool   `env:"LOCALAI_AUTO_APPROVE_NODES" default:"false" help:"Auto-approve new worker nodes (skip admin approval)" group:"distributed"`
+	RegistrationToken                 string `env:"LOCALAI_REGISTRATION_TOKEN" help:"Token that backend nodes must provide to register (empty = no auth required)" group:"distributed"`
+	AutoApproveNodes                  bool   `env:"LOCALAI_AUTO_APPROVE_NODES" default:"false" help:"Auto-approve new worker nodes (skip admin approval)" group:"distributed"`
+	DistributedSharedModelsFilesystem bool   `env:"LOCALAI_DISTRIBUTED_SHARED_MODELS_FILESYSTEM" default:"false" help:"Workers mount the frontend's models directory at the same absolute path (shared NFS/PV). Skips uploading model weights to workers; per-request multimodal inputs and outputs still stream over HTTP. Note: TTS backends that re-translate model paths at request time may not work in this mode." group:"distributed"`
 
 	Version bool
 }
@@ -259,6 +260,9 @@ func (r *RunCMD) Run(ctx *cliContext.Context) error {
 	}
 	if r.AutoApproveNodes {
 		opts = append(opts, config.EnableAutoApproveNodes)
+	}
+	if r.DistributedSharedModelsFilesystem {
+		opts = append(opts, config.EnableSharedModelsFilesystem)
 	}
 
 	if r.DisableMetricsEndpoint {
