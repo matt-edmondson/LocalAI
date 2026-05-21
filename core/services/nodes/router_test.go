@@ -574,6 +574,33 @@ var _ = Describe("SmartRouter", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("no available nodes"))
 		})
+
+		It("with estimatedVRAM>0 and no node fitting, skips idle/least-loaded fallback (goes to eviction)", func() {
+			// VRAM filter returns no node; idle and least-loaded would succeed
+			// if consulted, but the patched scheduler must skip them because we
+			// have a VRAM estimate that says they're too small to fit the model.
+			// With DB=nil, eviction returns ErrEvictionBusy and the call fails
+			// rather than picking a known-too-small node and OOMing at load.
+			reg.findVRAMErr = errors.New("no node fits")
+			reg.findIdleNode = &BackendNode{ID: "small-but-idle", Name: "idle"}
+			reg.findLeastLoadedNode = &BackendNode{ID: "small-but-ll", Name: "ll"}
+
+			router := NewSmartRouter(reg, SmartRouterOptions{
+				Unloader:      unloader,
+				ClientFactory: factory,
+				VRAMEstimator: func(_ context.Context, _ *pb.ModelOptions) uint64 {
+					return 25 * 1024 * 1024 * 1024 // 25 GiB — more than any test node has
+				},
+				// DB nil → eviction returns ErrEvictionBusy, so Route fails.
+			})
+
+			_, err := router.Route(context.Background(), "m-vram", "models/m-vram.gguf",
+				"llama-cpp", &pb.ModelOptions{}, false)
+			Expect(err).To(HaveOccurred())
+			// Must NOT have picked the known-too-small idle / least-loaded nodes.
+			Expect(err.Error()).ToNot(ContainSubstring("small-but-idle"))
+			Expect(err.Error()).ToNot(ContainSubstring("small-but-ll"))
+		})
 	})
 
 	Describe("UnloadModel (mock-based)", func() {

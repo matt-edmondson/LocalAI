@@ -48,6 +48,11 @@ type SmartRouterOptions struct {
 	// short-circuits weight-file staging and leaves ModelFile/MMProj/etc.
 	// at their local absolute paths so the worker reads them directly.
 	SharedModelsFilesystem bool
+	// VRAMEstimator overrides the model VRAM estimator. Production code leaves
+	// this nil and SmartRouter uses estimateModelVRAM. Tests inject a stub so
+	// they can exercise the VRAM-aware scheduling branches without real GGUF
+	// files on disk.
+	VRAMEstimator func(context.Context, *pb.ModelOptions) uint64
 }
 
 // SmartRouter routes inference requests to the best available backend node.
@@ -63,6 +68,10 @@ type SmartRouter struct {
 	conflictResolver ConcurrencyConflictResolver
 	// sharedModelsFilesystem: see SmartRouterOptions.SharedModelsFilesystem.
 	sharedModelsFilesystem bool
+	// vramEstimator is the function that returns the estimated VRAM bytes
+	// required to load a model. Defaults to estimateModelVRAM; overridable
+	// via SmartRouterOptions.VRAMEstimator for tests.
+	vramEstimator func(context.Context, *pb.ModelOptions) uint64
 	// installFlight coalesces concurrent identical NATS install requests
 	// (same nodeID + backend + modelID + replica) so 6 simultaneous chat
 	// completions for one not-yet-loaded model produce ONE round-trip, not
@@ -80,7 +89,7 @@ func NewSmartRouter(registry ModelRouter, opts SmartRouterOptions) *SmartRouter 
 	if opts.SharedModelsFilesystem {
 		xlog.Info("Shared models filesystem mode enabled — frontend will skip model-weight staging to workers")
 	}
-	return &SmartRouter{
+	r := &SmartRouter{
 		registry:               registry,
 		unloader:               opts.Unloader,
 		fileStager:             opts.FileStager,
@@ -91,6 +100,11 @@ func NewSmartRouter(registry ModelRouter, opts SmartRouterOptions) *SmartRouter 
 		conflictResolver:       opts.ConflictResolver,
 		sharedModelsFilesystem: opts.SharedModelsFilesystem,
 	}
+	r.vramEstimator = opts.VRAMEstimator
+	if r.vramEstimator == nil {
+		r.vramEstimator = r.estimateModelVRAM
+	}
+	return r
 }
 
 // Unloader returns the remote unloader adapter for external use.
@@ -505,7 +519,7 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 	// Estimate VRAM required for the model
 	var estimatedVRAM uint64
 	if modelOpts != nil {
-		estimatedVRAM = r.estimateModelVRAM(ctx, modelOpts)
+		estimatedVRAM = r.vramEstimator(ctx, modelOpts)
 	}
 
 	// Check for scheduling constraints (node selector). If a selector is set,
@@ -542,6 +556,12 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 
 	var node *BackendNode
 
+	// VRAM-aware scheduling: when we have a model size estimate, restrict
+	// scheduling to nodes that can actually fit it. The FindIdleNode /
+	// FindLeastLoadedNode fallbacks below ignore VRAM and will happily pick
+	// a node that's about to OOM, so we skip them when the VRAM filter ran
+	// and returned nothing — eviction is the correct next step.
+	vramFilteredOut := false
 	if estimatedVRAM > 0 {
 		if candidateNodeIDs != nil {
 			node, err = r.registry.FindNodeWithVRAMFromSet(ctx, estimatedVRAM, candidateNodeIDs)
@@ -549,12 +569,16 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 			node, err = r.registry.FindNodeWithVRAM(ctx, estimatedVRAM)
 		}
 		if err != nil {
-			xlog.Warn("No nodes with enough VRAM, falling back to standard scheduling",
+			xlog.Info("No node has enough free VRAM; deferring to eviction",
 				"required_vram", vram.FormatBytes(estimatedVRAM), "error", err)
+			vramFilteredOut = true
 		}
 	}
 
-	if node == nil {
+	// Only consult the VRAM-unaware fallback when we didn't have (or couldn't
+	// compute) a VRAM estimate. Otherwise a node we KNOW is too small would
+	// silently get picked here and OOM at load time.
+	if node == nil && !vramFilteredOut {
 		if candidateNodeIDs != nil {
 			node, err = r.registry.FindIdleNodeFromSet(ctx, candidateNodeIDs)
 			if err != nil {
@@ -568,16 +592,84 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 		}
 	}
 
-	// 4. Preemptive eviction: if no suitable node found, evict the LRU model with zero in-flight
+	// 4. Preemptive eviction: if no suitable node found, evict the LRU model
+	//    with zero in-flight.
+	//
+	//    Two failure modes need handling beyond a single eviction call:
+	//      - "All models busy" (ErrEvictionBusy) — retry briefly. The typical
+	//        pattern is a chat completion finishing right after we tried,
+	//        freeing the model for eviction on the next pass.
+	//      - "Evicted but freed node still doesn't fit" — the global LRU is on
+	//        a node that even after the unload doesn't have enough free VRAM
+	//        for our model. Without this guard, picking that node and running
+	//        LoadModel would OOM. Evict more (a different LRU) until the node
+	//        passes the VRAM filter or we exhaust candidates.
+	//
+	//    Eviction releases VRAM physically only after the worker handles the
+	//    NATS unload and its next heartbeat refreshes available_vram in the
+	//    registry — typically <1× HeartbeatInterval. We poll for a short
+	//    window before deciding the node still doesn't fit.
 	if node == nil {
-		evictedNode, evictErr := r.evictLRUAndFreeNode(ctx)
-		if evictErr != nil {
-			if errors.Is(evictErr, ErrEvictionBusy) {
-				return nil, "", 0, fmt.Errorf("no healthy nodes available: %w", evictErr)
+		const (
+			evictionBusyRetries = 6
+			evictionBusyDelay   = 500 * time.Millisecond
+
+			postEvictPollAttempts = 6
+			postEvictPollDelay    = 500 * time.Millisecond
+		)
+
+		for outer := 0; outer < evictionBusyRetries; outer++ {
+			evictedNode, evictErr := r.evictLRUAndFreeNode(ctx)
+			if evictErr != nil {
+				if !errors.Is(evictErr, ErrEvictionBusy) {
+					return nil, "", 0, fmt.Errorf("no healthy nodes available and eviction failed: %w", evictErr)
+				}
+				// Busy — wait briefly and try again. Honour context cancellation.
+				select {
+				case <-time.After(evictionBusyDelay):
+					continue
+				case <-ctx.Done():
+					return nil, "", 0, fmt.Errorf("eviction interrupted: %w", ctx.Err())
+				}
 			}
-			return nil, "", 0, fmt.Errorf("no healthy nodes available and eviction failed: %w", evictErr)
+
+			// If we have a VRAM estimate, verify the evicted node now fits
+			// the model. Poll briefly since the worker's heartbeat is what
+			// refreshes available_vram after the physical unload completes.
+			if estimatedVRAM > 0 {
+				fits := false
+				for poll := 0; poll < postEvictPollAttempts; poll++ {
+					candidate, vramErr := r.registry.FindNodeWithVRAMFromSet(ctx, estimatedVRAM, []string{evictedNode.ID})
+					if vramErr == nil && candidate != nil {
+						node = candidate
+						fits = true
+						break
+					}
+					select {
+					case <-time.After(postEvictPollDelay):
+					case <-ctx.Done():
+						return nil, "", 0, fmt.Errorf("eviction VRAM-recheck interrupted: %w", ctx.Err())
+					}
+				}
+				if !fits {
+					// The evicted node still doesn't fit. Try evicting another
+					// LRU; on the next outer iteration evictLRUAndFreeNode
+					// picks a different (now-LRU) model.
+					xlog.Info("Evicted node still lacks VRAM, evicting again",
+						"node", evictedNode.Name,
+						"required_vram", vram.FormatBytes(estimatedVRAM))
+					continue
+				}
+			} else {
+				node = evictedNode
+			}
+			break
 		}
-		node = evictedNode
+
+		if node == nil {
+			return nil, "", 0, fmt.Errorf("eviction could not free a node with %s VRAM for model %s",
+				vram.FormatBytes(estimatedVRAM), modelID)
+		}
 	}
 
 	// Allocate the replica slot before sending backend.install so the worker
