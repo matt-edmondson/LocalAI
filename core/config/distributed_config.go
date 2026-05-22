@@ -38,7 +38,15 @@ type DistributedConfig struct {
 	WorkerWaitTimeout   time.Duration // Max wait for healthy worker at startup (default 5m)
 	DrainTimeout        time.Duration // Time to wait for in-flight requests during drain (default 30s)
 	HealthCheckInterval time.Duration // Health monitor check interval (default 15s)
-	StaleNodeThreshold  time.Duration // Time before a node is considered stale (default 60s)
+	// BackendInstallTimeout is the ceiling on a NATS backend.install request-reply
+	// from the master to a worker. Most calls return in under a second (the worker
+	// short-circuits when the process is already running), but the cold-binary
+	// spawn-after-download path on slow uplinks can exceed the 3-minute default.
+	// Raise this when you see "no available nodes: installing backend on node X:
+	// NATS request to nodes.<id>.backend.install: nats: timeout" errors during
+	// model load.
+	BackendInstallTimeout time.Duration // (default 3m)
+	StaleNodeThreshold    time.Duration // Time before a node is considered stale (default 60s)
 	// DisablePerModelHealthCheck turns off the health monitor's per-model
 	// gRPC probe. When enabled (the default), the monitor pings each model's
 	// gRPC address and removes stale node_models rows whose backend has
@@ -48,7 +56,7 @@ type DistributedConfig struct {
 	// model-row cleanup on MarkUnhealthy / MarkDraining).
 	DisablePerModelHealthCheck bool
 
-	MCPCIJobTimeout     time.Duration // MCP CI job execution timeout (default 10m)
+	MCPCIJobTimeout time.Duration // MCP CI job execution timeout (default 10m)
 
 	MaxUploadSize int64 // Maximum upload body size in bytes (default 50 GB)
 
@@ -76,13 +84,14 @@ func (c DistributedConfig) Validate() error {
 	}
 	// Check for negative durations
 	for name, d := range map[string]time.Duration{
-		"mcp-tool-timeout":      c.MCPToolTimeout,
-		"mcp-discovery-timeout": c.MCPDiscoveryTimeout,
-		"worker-wait-timeout":   c.WorkerWaitTimeout,
-		"drain-timeout":         c.DrainTimeout,
-		"health-check-interval": c.HealthCheckInterval,
-		"stale-node-threshold":  c.StaleNodeThreshold,
-		"mcp-ci-job-timeout":    c.MCPCIJobTimeout,
+		"mcp-tool-timeout":        c.MCPToolTimeout,
+		"mcp-discovery-timeout":   c.MCPDiscoveryTimeout,
+		"worker-wait-timeout":     c.WorkerWaitTimeout,
+		"drain-timeout":           c.DrainTimeout,
+		"health-check-interval":   c.HealthCheckInterval,
+		"stale-node-threshold":    c.StaleNodeThreshold,
+		"mcp-ci-job-timeout":      c.MCPCIJobTimeout,
+		"backend-install-timeout": c.BackendInstallTimeout,
 	} {
 		if d < 0 {
 			return fmt.Errorf("%s must not be negative", name)
@@ -157,13 +166,14 @@ var EnableSharedModelsFilesystem = func(o *ApplicationConfig) {
 
 // Defaults for distributed timeouts.
 const (
-	DefaultMCPToolTimeout      = 360 * time.Second
-	DefaultMCPDiscoveryTimeout = 60 * time.Second
-	DefaultWorkerWaitTimeout   = 5 * time.Minute
-	DefaultDrainTimeout        = 30 * time.Second
-	DefaultHealthCheckInterval = 15 * time.Second
-	DefaultStaleNodeThreshold  = 60 * time.Second
-	DefaultMCPCIJobTimeout     = 10 * time.Minute
+	DefaultMCPToolTimeout        = 360 * time.Second
+	DefaultMCPDiscoveryTimeout   = 60 * time.Second
+	DefaultWorkerWaitTimeout     = 5 * time.Minute
+	DefaultDrainTimeout          = 30 * time.Second
+	DefaultHealthCheckInterval   = 15 * time.Second
+	DefaultStaleNodeThreshold    = 60 * time.Second
+	DefaultMCPCIJobTimeout       = 10 * time.Minute
+	DefaultBackendInstallTimeout = 3 * time.Minute
 )
 
 // DefaultMaxUploadSize is the default maximum upload body size (50 GB).
@@ -207,4 +217,17 @@ func (c DistributedConfig) MCPCIJobTimeoutOrDefault() time.Duration {
 // MaxUploadSizeOrDefault returns the configured max upload size or the default.
 func (c DistributedConfig) MaxUploadSizeOrDefault() int64 {
 	return cmp.Or(c.MaxUploadSize, DefaultMaxUploadSize)
+}
+
+// BackendInstallTimeoutOrDefault returns the configured timeout or the default.
+func (c DistributedConfig) BackendInstallTimeoutOrDefault() time.Duration {
+	return cmp.Or(c.BackendInstallTimeout, DefaultBackendInstallTimeout)
+}
+
+// WithBackendInstallTimeout sets the NATS backend.install request-reply ceiling
+// on the master. See DistributedConfig.BackendInstallTimeout for the rationale.
+func WithBackendInstallTimeout(d time.Duration) AppOption {
+	return func(o *ApplicationConfig) {
+		o.Distributed.BackendInstallTimeout = d
+	}
 }

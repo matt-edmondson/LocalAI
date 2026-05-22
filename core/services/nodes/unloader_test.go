@@ -119,7 +119,7 @@ var _ = Describe("RemoteUnloaderAdapter", func() {
 	BeforeEach(func() {
 		locator = &fakeModelLocator{}
 		mc = &fakeMessagingClient{}
-		adapter = NewRemoteUnloaderAdapter(locator, mc)
+		adapter = NewRemoteUnloaderAdapter(locator, mc, 0)
 	})
 
 	Describe("UnloadRemoteModel", func() {
@@ -154,7 +154,7 @@ var _ = Describe("RemoteUnloaderAdapter", func() {
 			}
 			// Use a messaging client that fails the first Publish call only.
 			failOnce := &failOnceMessagingClient{inner: mc, failOn: 0}
-			adapter = NewRemoteUnloaderAdapter(locator, failOnce)
+			adapter = NewRemoteUnloaderAdapter(locator, failOnce, 0)
 
 			Expect(adapter.UnloadRemoteModel("llama")).To(Succeed())
 

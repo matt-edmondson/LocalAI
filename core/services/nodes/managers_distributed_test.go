@@ -204,7 +204,7 @@ var _ = Describe("DistributedBackendManager", func() {
 		Expect(err).ToNot(HaveOccurred())
 
 		mc = newScriptedMessagingClient()
-		adapter = NewRemoteUnloaderAdapter(nil, mc)
+		adapter = NewRemoteUnloaderAdapter(nil, mc, 0)
 		mgr = &DistributedBackendManager{
 			local:    stubLocalBackendManager{},
 			adapter:  adapter,
