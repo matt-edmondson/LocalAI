@@ -56,7 +56,7 @@ var _ = Describe("Node Backend Lifecycle (NATS-driven)", Label("Distributed"), f
 
 			FlushNATS(infra.NC)
 
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 0)
 			installReply, err := adapter.InstallBackend(node.ID, "llama-cpp", "", "", "", "", "", 0)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(installReply.Success).To(BeTrue())
@@ -77,7 +77,7 @@ var _ = Describe("Node Backend Lifecycle (NATS-driven)", Label("Distributed"), f
 
 			FlushNATS(infra.NC)
 
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 0)
 			installReply, err := adapter.InstallBackend(node.ID, "nonexistent", "", "", "", "", "", 0)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(installReply.Success).To(BeFalse())
@@ -103,7 +103,7 @@ var _ = Describe("Node Backend Lifecycle (NATS-driven)", Label("Distributed"), f
 			FlushNATS(infra.NC)
 
 			// Frontend calls UnloadRemoteModel (triggered by UI "Stop" or WatchDog)
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 0)
 			Expect(adapter.UnloadRemoteModel("whisper-large")).To(Succeed())
 
 			Eventually(func() int32 { return stopReceived.Load() }, "5s").Should(Equal(int32(1)))
@@ -133,14 +133,14 @@ var _ = Describe("Node Backend Lifecycle (NATS-driven)", Label("Distributed"), f
 
 			FlushNATS(infra.NC)
 
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 0)
 			adapter.UnloadRemoteModel("shared-model")
 
 			Eventually(func() int32 { return count.Load() }, "5s").Should(Equal(int32(2)))
 		})
 
 		It("should be no-op for models not on any node", func() {
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 0)
 			Expect(adapter.UnloadRemoteModel("nonexistent-model")).To(Succeed())
 		})
 	})
@@ -161,7 +161,7 @@ var _ = Describe("Node Backend Lifecycle (NATS-driven)", Label("Distributed"), f
 
 			FlushNATS(infra.NC)
 
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 0)
 			Expect(adapter.StopNode(node.ID)).To(Succeed())
 
 			Eventually(func() int32 { return stopped.Load() }, "5s").Should(Equal(int32(1)))

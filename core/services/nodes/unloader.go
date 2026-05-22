@@ -43,15 +43,22 @@ type NodeCommandSender interface {
 // This mirrors the local ModelLoader's startProcess()/deleteProcess() but
 // over NATS for remote nodes.
 type RemoteUnloaderAdapter struct {
-	registry ModelLocator
-	nats     messaging.MessagingClient
+	registry       ModelLocator
+	nats           messaging.MessagingClient
+	installTimeout time.Duration
 }
 
-// NewRemoteUnloaderAdapter creates a new adapter.
-func NewRemoteUnloaderAdapter(registry ModelLocator, nats messaging.MessagingClient) *RemoteUnloaderAdapter {
+// NewRemoteUnloaderAdapter creates a new adapter. installTimeout caps the NATS
+// backend.install request-reply (see InstallBackend). A non-positive value
+// falls back to the package default of 3 minutes.
+func NewRemoteUnloaderAdapter(registry ModelLocator, nats messaging.MessagingClient, installTimeout time.Duration) *RemoteUnloaderAdapter {
+	if installTimeout <= 0 {
+		installTimeout = 3 * time.Minute
+	}
 	return &RemoteUnloaderAdapter{
-		registry: registry,
-		nats:     nats,
+		registry:       registry,
+		nats:           nats,
+		installTimeout: installTimeout,
 	}
 }
 
@@ -87,16 +94,18 @@ func (a *RemoteUnloaderAdapter) UnloadRemoteModel(modelName string) error {
 // is on disk, the worker just spawns a process; only a missing binary
 // triggers a full gallery pull.
 //
-// Timeout: 3 minutes. Most calls return in under 2 seconds (process already
-// running). The 3-minute ceiling covers the cold-binary spawn-after-download
-// case while still failing fast enough to surface real worker hangs.
+// Timeout: configurable via the adapter's installTimeout (set by the caller
+// from LOCALAI_BACKEND_INSTALL_TIMEOUT, default 3 minutes). Most calls return
+// in under 2 seconds (process already running). The ceiling covers the
+// cold-binary spawn-after-download case while still failing fast enough to
+// surface real worker hangs.
 //
 // For force-reinstall (admin-driven Upgrade), use UpgradeBackend instead —
 // it lives on a different NATS subject so it cannot head-of-line-block
 // routine load traffic on the same worker.
 func (a *RemoteUnloaderAdapter) InstallBackend(nodeID, backendType, modelID, galleriesJSON, uri, name, alias string, replicaIndex int) (*messaging.BackendInstallReply, error) {
 	subject := messaging.SubjectNodeBackendInstall(nodeID)
-	xlog.Info("Sending NATS backend.install", "nodeID", nodeID, "backend", backendType, "modelID", modelID, "replica", replicaIndex)
+	xlog.Info("Sending NATS backend.install", "nodeID", nodeID, "backend", backendType, "modelID", modelID, "replica", replicaIndex, "timeout", a.installTimeout)
 
 	return messaging.RequestJSON[messaging.BackendInstallRequest, messaging.BackendInstallReply](a.nats, subject, messaging.BackendInstallRequest{
 		Backend:          backendType,
@@ -106,7 +115,7 @@ func (a *RemoteUnloaderAdapter) InstallBackend(nodeID, backendType, modelID, gal
 		Name:             name,
 		Alias:            alias,
 		ReplicaIndex:     int32(replicaIndex),
-	}, 3*time.Minute)
+	}, a.installTimeout)
 }
 
 // UpgradeBackend sends a backend.upgrade request-reply to a worker node.

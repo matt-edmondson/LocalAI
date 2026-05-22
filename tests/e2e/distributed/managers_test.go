@@ -175,7 +175,7 @@ var _ = Describe("Model and Backend Managers", Label("Distributed"), func() {
 			appCfg := config.NewApplicationConfig()
 			appCfg.SystemState = ss
 
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 0)
 			distMgr := nodes.NewDistributedModelManager(appCfg, ml, adapter)
 
 			err = distMgr.DeleteModel("big-model")
@@ -251,7 +251,7 @@ var _ = Describe("Model and Backend Managers", Label("Distributed"), func() {
 			appCfg := config.NewApplicationConfig()
 			appCfg.SystemState = ss
 
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 0)
 			distMgr := nodes.NewDistributedBackendManager(appCfg, ml, adapter, registry)
 
 			err = distMgr.DeleteBackend("my-backend")
@@ -298,7 +298,7 @@ var _ = Describe("Model and Backend Managers", Label("Distributed"), func() {
 			appCfg := config.NewApplicationConfig()
 			appCfg.SystemState = ss
 
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 0)
 			distMgr := nodes.NewDistributedBackendManager(appCfg, ml, adapter, registry)
 
 			// Should NOT return an error even though the backend doesn't exist locally

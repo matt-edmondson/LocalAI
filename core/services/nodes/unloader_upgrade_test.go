@@ -15,7 +15,7 @@ var _ = Describe("RemoteUnloaderAdapter.UpgradeBackend", func() {
 		mc.scriptReply(messaging.SubjectNodeBackendUpgrade(nodeID),
 			messaging.BackendUpgradeReply{Success: true})
 
-		adapter := NewRemoteUnloaderAdapter(nil, mc)
+		adapter := NewRemoteUnloaderAdapter(nil, mc, 0)
 		reply, err := adapter.UpgradeBackend(nodeID, "llama-cpp", `[{"name":"x"}]`, "", "", "", 0)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(reply.Success).To(BeTrue())
@@ -24,7 +24,7 @@ var _ = Describe("RemoteUnloaderAdapter.UpgradeBackend", func() {
 	It("returns the underlying error when the subject has no responders", func() {
 		mc := newScriptedMessagingClient() // unscripted subject => fakeNoRespondersErr by harness convention
 
-		adapter := NewRemoteUnloaderAdapter(nil, mc)
+		adapter := NewRemoteUnloaderAdapter(nil, mc, 0)
 		_, err := adapter.UpgradeBackend("missing-node", "llama-cpp", "", "", "", "", 0)
 		Expect(err).To(HaveOccurred())
 	})
