@@ -326,6 +326,11 @@ func New(opts ...config.AppOption) (*Application, error) {
 		}
 	}
 
+	// Hot-reload: watch the models directory for new or modified YAML configs
+	// written by external tools such as ModelMan. Polling is used when
+	// DynamicConfigsDirPollInterval is set (required for NFS mounts).
+	startModelDirWatcher(options, application.ModelConfigLoader())
+
 	// Watch the configuration directory
 	startWatcher(options)
 
