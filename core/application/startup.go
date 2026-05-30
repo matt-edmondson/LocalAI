@@ -17,9 +17,9 @@ import (
 	"github.com/mudler/LocalAI/core/services/jobs"
 	"github.com/mudler/LocalAI/core/services/nodes"
 	"github.com/mudler/LocalAI/core/services/storage"
-	"github.com/mudler/LocalAI/pkg/vram"
 	coreStartup "github.com/mudler/LocalAI/core/startup"
 	"github.com/mudler/LocalAI/internal"
+	"github.com/mudler/LocalAI/pkg/vram"
 
 	"github.com/mudler/LocalAI/pkg/model"
 	"github.com/mudler/LocalAI/pkg/sanitize"
@@ -161,6 +161,15 @@ func New(opts ...config.AppOption) (*Application, error) {
 		distSvc.Health.Start(options.Context)
 		// Start replica reconciler for auto-scaling model replicas
 		if distSvc.Reconciler != nil {
+			// When the reconciler reaps a model's last unreachable replica from
+			// the registry, also evict the loader's in-memory cache entry so a
+			// stale remote model doesn't linger and fail routing until a request
+			// trips the loader's own consecutive-failure eviction.
+			distSvc.Reconciler.SetOnReplicaReaped(func(modelName string) {
+				if err := application.modelLoader.ShutdownModel(modelName); err != nil {
+					xlog.Debug("Reaper: failed to evict in-memory model after last replica removed", "model", modelName, "error", err)
+				}
+			})
 			go distSvc.Reconciler.Run(options.Context)
 		}
 		// In distributed mode, MCP CI jobs are executed by agent workers (not the frontend)
