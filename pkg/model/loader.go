@@ -360,7 +360,24 @@ func (ml *ModelLoader) checkIsLoaded(s string) *Model {
 				}
 				return nil
 			}
-			xlog.Warn("Remote model health check failed (possible timeout), keeping cached", "model", s, "error", err)
+			// A timeout alone can mean "busy" rather than "dead", so we don't
+			// evict on the first failure. But a genuinely gone remote backend
+			// (worker rolled, OOM, crash) keeps timing out — without a ceiling
+			// it would be served as a phantom forever (routing to a replica the
+			// registry no longer has, surfacing as "Could not reach consumer").
+			// Evict after enough consecutive failures so it gets reloaded; a
+			// transiently-busy model recovers and resets the counter via MarkHealthy.
+			failures := m.RecordHealthFailure()
+			if failures >= remoteHealthFailureEvictThreshold {
+				xlog.Warn("Remote model failed health check repeatedly, removing from cache to force reload",
+					"model", s, "consecutiveFailures", failures, "error", err)
+				if delErr := ml.deleteProcess(s); delErr != nil {
+					xlog.Error("error cleaning up remote model", "error", delErr, "model", s)
+				}
+				return nil
+			}
+			xlog.Warn("Remote model health check failed (possible timeout), keeping cached for now",
+				"model", s, "consecutiveFailures", failures, "threshold", remoteHealthFailureEvictThreshold, "error", err)
 			return m
 		}
 		if !process.IsAlive() {

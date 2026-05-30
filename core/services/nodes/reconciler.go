@@ -56,6 +56,12 @@ type ReplicaReconciler struct {
 	// probeStaleAfter: only probe node_models rows older than this so we
 	// don't hammer every worker every tick for models we just heard from.
 	probeStaleAfter time.Duration
+	// onReplicaReaped, if set, is invoked with a model name after the background
+	// probe removes the *last* unreachable replica of that model. Lets the
+	// frontend evict its in-memory loader cache too, not just the node_models
+	// DB row — otherwise a phantom entry lingers until the next request trips
+	// the loader's own consecutive-failure eviction.
+	onReplicaReaped func(modelName string)
 }
 
 // ModelScheduler abstracts the scheduling logic needed by the reconciler.
@@ -68,9 +74,9 @@ type ModelScheduler interface {
 
 // ReplicaReconcilerOptions holds configuration for creating a ReplicaReconciler.
 type ReplicaReconcilerOptions struct {
-	Registry *NodeRegistry
+	Registry  *NodeRegistry
 	Scheduler ModelScheduler
-	Unloader NodeCommandSender
+	Unloader  NodeCommandSender
 	// Adapter is the NATS sender used to retry pending backend ops. When nil,
 	// the state-reconciler pending-drain pass is a no-op (single-node mode).
 	Adapter *RemoteUnloaderAdapter
@@ -78,7 +84,7 @@ type ReplicaReconcilerOptions struct {
 	// addresses. Matches the worker's token so HealthCheck auth succeeds.
 	RegistrationToken string
 	// Prober overrides the default gRPC health probe (used by tests).
-	Prober ModelProber
+	Prober          ModelProber
 	DB              *gorm.DB
 	Interval        time.Duration // default 30s
 	ScaleDownDelay  time.Duration // default 5m
@@ -114,6 +120,13 @@ func NewReplicaReconciler(opts ReplicaReconcilerOptions) *ReplicaReconciler {
 		scaleDownDelay:  scaleDownDelay,
 		probeStaleAfter: probeStaleAfter,
 	}
+}
+
+// SetOnReplicaReaped registers a callback invoked when the background reaper
+// removes the last replica of a model, so the caller can evict the frontend
+// loader's in-memory cache entry for it. Optional; safe to leave unset.
+func (rc *ReplicaReconciler) SetOnReplicaReaped(fn func(modelName string)) {
+	rc.onReplicaReaped = fn
 }
 
 // Run starts the reconciliation loop. It blocks until ctx is cancelled.
@@ -306,6 +319,18 @@ func (rc *ReplicaReconciler) probeLoadedModels(ctx context.Context) {
 		}
 		xlog.Warn("Reconciler: model unreachable, removed from registry",
 			"node", m.NodeID, "model", m.ModelName, "replica", m.ReplicaIndex, "address", m.Address)
+
+		// If that was the model's last replica, evict the frontend loader's
+		// in-memory cache too so the next request reloads instead of routing
+		// to a now-nonexistent replica ("Could not reach consumer").
+		if rc.onReplicaReaped != nil {
+			remaining, cErr := rc.registry.CountLoadedReplicas(ctx, m.ModelName)
+			if cErr != nil {
+				xlog.Warn("Reconciler: failed to count remaining replicas after reap", "model", m.ModelName, "error", cErr)
+			} else if remaining == 0 {
+				rc.onReplicaReaped(m.ModelName)
+			}
+		}
 	}
 }
 
