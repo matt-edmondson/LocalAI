@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/mudler/LocalAI/core/services/advisorylock"
+	"github.com/mudler/LocalAI/core/services/nodes/prefixcache"
+	"github.com/mudler/LocalAI/pkg/distributedhdr"
 	grpc "github.com/mudler/LocalAI/pkg/grpc"
 	pb "github.com/mudler/LocalAI/pkg/grpc/proto"
 	"github.com/mudler/LocalAI/pkg/vram"
@@ -53,6 +55,22 @@ type SmartRouterOptions struct {
 	// they can exercise the VRAM-aware scheduling branches without real GGUF
 	// files on disk.
 	VRAMEstimator func(context.Context, *pb.ModelOptions) uint64
+	// PrefixProvider, when set, enables prefix-cache-aware routing: requests
+	// carrying a prompt prefix chain (distributedhdr.PrefixChain) are biased
+	// toward the node that already holds the longest matching prefix, subject
+	// to the load guard in prefixcache.Select. nil disables it entirely and
+	// routing is byte-for-byte the round-robin floor. At runtime this is the
+	// *prefixcache.Sync so Observe/Invalidate broadcast to peers.
+	PrefixProvider prefixcache.Provider
+	// PrefixConfig holds the global policy + thresholds. Per-model overrides on
+	// ModelSchedulingConfig refine it per request. Unused when PrefixProvider
+	// is nil.
+	PrefixConfig prefixcache.Config
+	// Pressure, when set, records a forced-disturb each time a request had a
+	// usable hot prefix match but the load guard forced it off the warm node.
+	// The reconciler reads the same instance to autoscale a saturated cache-warm
+	// replica. nil disables recording (the disabled path stays a no-op).
+	Pressure *prefixcache.Pressure
 }
 
 // SmartRouter routes inference requests to the best available backend node.
@@ -72,12 +90,31 @@ type SmartRouter struct {
 	// required to load a model. Defaults to estimateModelVRAM; overridable
 	// via SmartRouterOptions.VRAMEstimator for tests.
 	vramEstimator func(context.Context, *pb.ModelOptions) uint64
+	// prefixProvider is the prefix-cache routing seam (nil disables it; see
+	// SmartRouterOptions.PrefixProvider). prefixConfig holds the global policy
+	// and thresholds.
+	prefixProvider prefixcache.Provider
+	prefixConfig   prefixcache.Config
+	// pressure records forced-disturb events (hot match forced off the warm
+	// node by the load guard). nil disables recording. See SmartRouterOptions.
+	pressure *prefixcache.Pressure
 	// installFlight coalesces concurrent identical NATS install requests
 	// (same nodeID + backend + modelID + replica) so 6 simultaneous chat
 	// completions for one not-yet-loaded model produce ONE round-trip, not
 	// six. Avoids amplifying head-of-line blocking on the worker side.
 	installFlight singleflight.Group
+	// probeCache memoizes recent successful gRPC HealthCheck results so
+	// per-request routing doesn't stall behind a busy backend's serialized
+	// HealthCheck/Predict. See probe_cache.go for the rationale.
+	probeCache *probeCache
 }
+
+// probeCacheTTL is how long a successful gRPC HealthCheck on a backend is
+// trusted before the next request re-probes. Matches healthCheckTTL in
+// pkg/model/model.go so the single-process and distributed paths share a
+// staleness budget. The background HealthMonitor still reaps dead backends
+// independently within ~45s (see perModelMissThreshold).
+const probeCacheTTL = 30 * time.Second
 
 // NewSmartRouter creates a new SmartRouter backed by the given ModelRouter.
 // All optional dependencies are passed via SmartRouterOptions to avoid post-creation races.
@@ -99,6 +136,10 @@ func NewSmartRouter(registry ModelRouter, opts SmartRouterOptions) *SmartRouter 
 		stagingTracker:         NewStagingTracker(),
 		conflictResolver:       opts.ConflictResolver,
 		sharedModelsFilesystem: opts.SharedModelsFilesystem,
+		probeCache:             newProbeCache(probeCacheTTL),
+		prefixProvider:         opts.PrefixProvider,
+		prefixConfig:           opts.PrefixConfig,
+		pressure:               opts.Pressure,
 	}
 	r.vramEstimator = opts.VRAMEstimator
 	if r.vramEstimator == nil {
@@ -169,11 +210,17 @@ func (r *SmartRouter) scheduleAndLoad(ctx context.Context, backendType, tracking
 		xlog.Warn("Failed to record model on node", "node", node.Name, "model", trackingKey, "replica", replicaIndex, "error", err)
 	}
 
-	// Store load metadata for future replica scale-ups by the reconciler
+	// Store load metadata for future replica scale-ups by the reconciler.
+	// Writes both per-replica (NodeModel.model_opts_blob) for backward compat
+	// and per-model (ModelLoadInfo table) so the reconciler can recover after
+	// every replica row has been removed (Bug-1).
 	if modelOpts != nil {
 		if optsBlob, marshalErr := proto.Marshal(modelOpts); marshalErr == nil {
 			if storeErr := r.registry.SetNodeModelLoadInfo(ctx, node.ID, trackingKey, replicaIndex, backendType, optsBlob); storeErr != nil {
 				xlog.Warn("Failed to store model load info", "node", node.Name, "model", trackingKey, "replica", replicaIndex, "error", storeErr)
+			}
+			if storeErr := r.registry.UpsertModelLoadInfo(ctx, trackingKey, backendType, optsBlob); storeErr != nil {
+				xlog.Warn("Failed to upsert per-model load info", "model", trackingKey, "error", storeErr)
 			}
 		}
 	}
@@ -237,18 +284,31 @@ func (r *SmartRouter) Route(ctx context.Context, modelID, modelName, backendType
 		trackingKey = modelName
 	}
 
+	// Fetch the model's scheduling config once: it is immutable for the life of
+	// this request, and resolveSelectorCandidates, buildPreference, and
+	// nodeMatchesScheduling all read it. Fetching once gives a consistent
+	// snapshot and avoids three DB round-trips for one row. nil sched means
+	// "no scheduling constraints", same as before.
+	sched, _ := r.registry.GetModelScheduling(ctx, trackingKey)
+
 	// Resolve the model's NodeSelector once so cached-replica lookup and the
 	// new-load scheduler agree on the candidate set. Without this, a cached
 	// replica on a node the selector now excludes was picked over a matching
 	// replica elsewhere, and the fall-through then tried to load on the
 	// matching node where the model was already at capacity (eviction-busy).
-	candidateNodeIDs, err := r.resolveSelectorCandidates(ctx, trackingKey)
+	candidateNodeIDs, err := r.resolveSelectorCandidates(ctx, trackingKey, sched)
 	if err != nil {
 		return nil, err
 	}
 
+	// Compute the prefix-cache preference once for this request. pref biases
+	// FindAndLockNodeWithModel toward the warm-cache node; observeChain is
+	// non-nil only when this model uses prefix_cache, gating the Observe calls
+	// below. Both are nil (no-op) when prefix-cache routing is disabled.
+	pref, observeChain := r.buildPreference(ctx, trackingKey, candidateNodeIDs, sched)
+
 	// Step 1: Find and atomically lock a node with this model loaded
-	node, nm, err := r.registry.FindAndLockNodeWithModel(ctx, trackingKey, candidateNodeIDs)
+	node, nm, err := r.registry.FindAndLockNodeWithModel(ctx, trackingKey, candidateNodeIDs, pref)
 	if err == nil && node != nil {
 		modelAddr := node.Address
 		if nm.Address != "" {
@@ -265,7 +325,7 @@ func (r *SmartRouter) Route(ctx context.Context, modelID, modelName, backendType
 				"node", node.Name, "model", modelName, "replica", replicaIdx)
 		} else {
 			// Verify node still matches scheduling constraints
-			if !r.nodeMatchesScheduling(ctx, node, trackingKey) {
+			if !r.nodeMatchesScheduling(ctx, node, sched) {
 				r.registry.DecrementInFlight(ctx, node.ID, trackingKey, replicaIdx)
 				xlog.Info("Cached model on node that no longer matches selector, falling through",
 					"node", node.Name, "model", trackingKey, "replica", replicaIdx)
@@ -276,6 +336,7 @@ func (r *SmartRouter) Route(ctx context.Context, modelID, modelName, backendType
 				// onFirstComplete callback releases the reservation after the first inference
 				// call finishes, so in-flight returns to 0 when idle.
 				r.registry.TouchNodeModel(ctx, node.ID, trackingKey, replicaIdx)
+				r.observePrefix(trackingKey, observeChain, prefixcache.ReplicaKey{NodeID: node.ID, Replica: replicaIdx})
 				grpcClient := r.buildClientForAddr(node, modelAddr, parallel)
 				tracked := NewInFlightTrackingClient(grpcClient, r.registry, node.ID, trackingKey, replicaIdx)
 				tracked.OnFirstComplete(func() {
@@ -295,7 +356,7 @@ func (r *SmartRouter) Route(ctx context.Context, modelID, modelName, backendType
 	// Step 2: Model not loaded — schedule loading with distributed lock to prevent duplicates
 	loadModel := func() (*RouteResult, error) {
 		// Re-check after acquiring lock — another request may have loaded it
-		node, nm, err := r.registry.FindAndLockNodeWithModel(ctx, trackingKey, candidateNodeIDs)
+		node, nm, err := r.registry.FindAndLockNodeWithModel(ctx, trackingKey, candidateNodeIDs, pref)
 		if err == nil && node != nil {
 			modelAddr := node.Address
 			if nm.Address != "" {
@@ -312,7 +373,7 @@ func (r *SmartRouter) Route(ctx context.Context, modelID, modelName, backendType
 					"node", node.Name, "model", modelName, "replica", replicaIdx)
 			} else {
 				// Verify node still matches scheduling constraints
-				if !r.nodeMatchesScheduling(ctx, node, trackingKey) {
+				if !r.nodeMatchesScheduling(ctx, node, sched) {
 					r.registry.DecrementInFlight(ctx, node.ID, trackingKey, replicaIdx)
 					xlog.Info("Cached model on node that no longer matches selector, falling through",
 						"node", node.Name, "model", trackingKey, "replica", replicaIdx)
@@ -321,6 +382,7 @@ func (r *SmartRouter) Route(ctx context.Context, modelID, modelName, backendType
 					// Model loaded while we waited — FindAndLockNodeWithModel already incremented
 					// in-flight as a reservation. Release it after the first inference completes.
 					r.registry.TouchNodeModel(ctx, node.ID, trackingKey, replicaIdx)
+					r.observePrefix(trackingKey, observeChain, prefixcache.ReplicaKey{NodeID: node.ID, Replica: replicaIdx})
 					grpcClient := r.buildClientForAddr(node, modelAddr, parallel)
 					tracked := NewInFlightTrackingClient(grpcClient, r.registry, node.ID, trackingKey, replicaIdx)
 					tracked.OnFirstComplete(func() {
@@ -343,6 +405,10 @@ func (r *SmartRouter) Route(ctx context.Context, modelID, modelName, backendType
 		if err != nil {
 			return nil, err
 		}
+
+		// Cold load landed on result.Node replica result.ReplicaIndex: record the
+		// assignment so subsequent requests with the same prefix prefer it.
+		r.observePrefix(trackingKey, observeChain, prefixcache.ReplicaKey{NodeID: result.Node.ID, Replica: result.ReplicaIndex})
 
 		replicaIdx := result.ReplicaIndex
 		tracked := NewInFlightTrackingClient(result.Client, r.registry, result.Node.ID, trackingKey, replicaIdx)
@@ -396,13 +462,117 @@ func extractNodeIDs(nodes []BackendNode) []string {
 	return ids
 }
 
+// buildPreference computes the per-request route preference from the prefix
+// chain on ctx and the model's resolved policy. The returned observeChain is
+// non-nil only when the resolved policy is prefix_cache, signalling Route to
+// record the assignment after a successful pick; for round-robin models it is
+// nil so the tree is never polluted. The *RoutePreference is non-nil only when
+// a load-eligible preferred node was chosen.
+//
+// When prefix-cache routing is disabled (nil provider), no chain is present,
+// or the policy resolves to round-robin, both returns are nil and routing is
+// the unchanged round-robin floor.
+func (r *SmartRouter) buildPreference(ctx context.Context, modelID string, candidateNodeIDs []string, sched *ModelSchedulingConfig) (*RoutePreference, []uint64) {
+	if r.prefixProvider == nil {
+		return nil, nil
+	}
+	chain := distributedhdr.PrefixChain(ctx)
+	if len(chain) == 0 {
+		return nil, nil
+	}
+
+	// Resolve per-model policy + thresholds over the global config.
+	policy := r.prefixConfig.GlobalPolicy
+	cfg := r.prefixConfig
+	if sched != nil {
+		policy = prefixcache.ParsePolicy(sched.RoutePolicy).Resolve(r.prefixConfig.GlobalPolicy)
+		if sched.BalanceAbsThreshold > 0 {
+			cfg.BalanceAbsThreshold = sched.BalanceAbsThreshold
+		}
+		if sched.BalanceRelThreshold > 0 {
+			cfg.BalanceRelThreshold = sched.BalanceRelThreshold
+		}
+		if sched.MinPrefixMatch > 0 {
+			cfg.MinPrefixMatch = sched.MinPrefixMatch
+		}
+	}
+	if policy != prefixcache.RoutePolicyPrefixCache {
+		return nil, nil
+	}
+
+	// Load the candidate replicas PER REPLICA. Affinity is tracked per replica
+	// (each replica is a separate process with its own KV cache), so two
+	// replicas of the same model on the same node are two distinct candidates.
+	// FindAndLockNodeWithModel then locks the EXACT (node, replica) the policy
+	// chose.
+	stats, err := r.registry.LoadedReplicaStats(ctx, modelID, candidateNodeIDs)
+	if err != nil {
+		xlog.Debug("prefixcache: loading replica stats failed, skipping preference", "model", modelID, "error", err)
+		return nil, chain
+	}
+	if len(stats) == 0 {
+		return nil, chain
+	}
+	cands := make([]prefixcache.Candidate, 0, len(stats))
+	keys := make([]prefixcache.ReplicaKey, 0, len(stats))
+	for _, s := range stats {
+		key := prefixcache.ReplicaKey{NodeID: s.NodeID, Replica: s.ReplicaIndex}
+		cands = append(cands, prefixcache.Candidate{Key: key, InFlight: s.InFlight})
+		keys = append(keys, key)
+	}
+
+	d := r.prefixProvider.Decide(modelID, chain, keys, time.Now())
+	chosen, ok := prefixcache.Select(cands, d, cfg)
+
+	// Observability for the prefix-cache routing decision. One line per request
+	// at Debug: enable with DEBUG=true on the frontend to assess cache-aware
+	// routing. hotMatchHonored=true means we routed to the cache-warm replica;
+	// false with HasHot means the load guard forced a cold pick.
+	xlog.Debug("prefix-cache routing decision",
+		"model", modelID,
+		"chainDepth", len(chain),
+		"candidates", len(cands),
+		"hotNode", d.Hot.NodeID,
+		"hotReplica", d.Hot.Replica,
+		"hasHot", d.HasHot,
+		"matchRatio", d.MatchRatio,
+		"minMatch", cfg.MinPrefixMatch,
+		"chosen", fmt.Sprintf("%s/%d", chosen.NodeID, chosen.Replica),
+		"hotMatchHonored", d.HasHot && chosen == d.Hot)
+
+	// Forced-disturb: a usable hot prefix match existed but the load guard
+	// forced us off the warm replica (Select picked a different replica). This
+	// is the scale-worthy signal - the cache-warm replica is saturated. It
+	// deliberately does not fire for all-unique workloads (no hot match),
+	// avoiding false-positive scale-ups. nil pressure is a no-op.
+	if r.pressure != nil && d.HasHot && d.MatchRatio >= cfg.MinPrefixMatch && chosen != d.Hot {
+		r.pressure.Record(modelID, time.Now())
+	}
+
+	if !ok {
+		return nil, chain
+	}
+	return &RoutePreference{PreferredNodeID: chosen.NodeID, PreferredReplica: chosen.Replica}, chain
+}
+
+// observePrefix records that the replica `key` served the request whose prompt
+// prefix is chain. It is a no-op when prefix-cache routing is disabled or the
+// chain is empty (round-robin models pass a nil chain so the tree is never
+// polluted).
+func (r *SmartRouter) observePrefix(modelID string, chain []uint64, key prefixcache.ReplicaKey) {
+	if r.prefixProvider == nil || len(chain) == 0 {
+		return
+	}
+	r.prefixProvider.Observe(modelID, chain, key, time.Now())
+	xlog.Debug("prefix-cache observed assignment", "model", modelID, "node", key.NodeID, "replica", key.Replica, "chainDepth", len(chain))
+}
+
 // resolveSelectorCandidates returns the node IDs that match the model's
 // NodeSelector. Returns nil when no selector is configured ("any healthy node"
 // — registry helpers treat nil as no filter). Returns an error when a
 // non-empty selector matches zero healthy nodes, since there is nothing to
 // route or schedule on.
-func (r *SmartRouter) resolveSelectorCandidates(ctx context.Context, modelID string) ([]string, error) {
-	sched, _ := r.registry.GetModelScheduling(ctx, modelID)
+func (r *SmartRouter) resolveSelectorCandidates(ctx context.Context, modelID string, sched *ModelSchedulingConfig) ([]string, error) {
 	if sched == nil || sched.NodeSelector == "" {
 		return nil, nil
 	}
@@ -476,9 +646,8 @@ func (r *SmartRouter) narrowByGroupAntiAffinity(ctx context.Context, modelID str
 
 // nodeMatchesScheduling checks if a node satisfies the scheduling constraints for a model.
 // Returns true if no constraints exist or the node matches all selector labels.
-func (r *SmartRouter) nodeMatchesScheduling(ctx context.Context, node *BackendNode, modelName string) bool {
-	sched, err := r.registry.GetModelScheduling(ctx, modelName)
-	if err != nil || sched == nil || sched.NodeSelector == "" {
+func (r *SmartRouter) nodeMatchesScheduling(ctx context.Context, node *BackendNode, sched *ModelSchedulingConfig) bool {
+	if sched == nil || sched.NodeSelector == "" {
 		return true // no constraints
 	}
 
@@ -525,7 +694,8 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 	// Check for scheduling constraints (node selector). If a selector is set,
 	// we restrict the candidate pool to matching nodes; otherwise nil means
 	// "any healthy node".
-	candidateNodeIDs, err := r.resolveSelectorCandidates(ctx, modelID)
+	sched, _ := r.registry.GetModelScheduling(ctx, modelID)
+	candidateNodeIDs, err := r.resolveSelectorCandidates(ctx, modelID, sched)
 	if err != nil {
 		return nil, "", 0, err
 	}
@@ -791,7 +961,7 @@ func (r *SmartRouter) installBackendOnNode(ctx context.Context, node *BackendNod
 
 	key := fmt.Sprintf("%s|%s|%s|%d", node.ID, backendType, modelID, replicaIndex)
 	v, err, _ := r.installFlight.Do(key, func() (any, error) {
-		reply, err := r.unloader.InstallBackend(node.ID, backendType, modelID, r.galleriesJSON, "", "", "", replicaIndex)
+		reply, err := r.unloader.InstallBackend(node.ID, backendType, modelID, r.galleriesJSON, "", "", "", replicaIndex, "", nil)
 		if err != nil {
 			return "", err
 		}
@@ -1084,14 +1254,26 @@ func (r *SmartRouter) stageGenericOptions(ctx context.Context, node *BackendNode
 }
 
 // probeHealth checks whether a backend process on the given node/addr is alive
-// via a gRPC health check with a 2-second timeout. The client is closed after the check.
+// via a gRPC health check with a 2-second timeout. The client is closed after
+// the check.
+//
+// The result is memoized in r.probeCache for probeCacheTTL. With per-request
+// routing every inference call lands here, and unbounded re-probing can stall
+// behind a busy backend that serializes HealthCheck against active Predict.
+// Concurrent probes for the same (node, addr) coalesce via singleflight so a
+// burst of N requests for a cold cache costs at most one round-trip, not N.
+// Failed probes invalidate the cache so the staleness recovery path
+// (DecrementInFlight + RemoveNodeModel) still triggers on the next request.
 func (r *SmartRouter) probeHealth(ctx context.Context, node *BackendNode, addr string) bool {
-	client := r.buildClientForAddr(node, addr, false)
-	defer closeClient(client)
-	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	ok, _ := client.HealthCheck(checkCtx)
-	return ok
+	key := node.ID + "|" + addr
+	return r.probeCache.DoOrCached(key, func() bool {
+		client := r.buildClientForAddr(node, addr, false)
+		defer closeClient(client)
+		checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		ok, _ := client.HealthCheck(checkCtx)
+		return ok
+	})
 }
 
 // closeClient closes a gRPC backend client if it implements io.Closer.
