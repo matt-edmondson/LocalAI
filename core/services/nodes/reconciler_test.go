@@ -485,6 +485,10 @@ var _ = Describe("ReplicaReconciler — state reconciliation", func() {
 				DB:              db,
 				Prober:          prober,
 				ProbeStaleAfter: 2 * time.Minute,
+				// Threshold 1: a single unreachable probe reaps immediately
+				// (this test asserts the reap + fresh-row-skip mechanics; the
+				// consecutive-failure grace is covered by its own spec below).
+				ProbeFailureThreshold: 1,
 			})
 
 			rc.probeLoadedModels(context.Background())
@@ -524,6 +528,107 @@ var _ = Describe("ReplicaReconciler — state reconciliation", func() {
 			var after NodeModel
 			Expect(db.First(&after, "id = ?", "stale-2").Error).To(Succeed())
 			Expect(after.UpdatedAt).To(BeTemporally("~", time.Now(), time.Second))
+		})
+
+		It("does not probe or reap a model with in-flight requests", func() {
+			node := &BackendNode{Name: "n1", NodeType: NodeTypeBackend, Address: "10.0.0.1:50051"}
+			Expect(registry.Register(context.Background(), node, true)).To(Succeed())
+			busy := &NodeModel{
+				ID:        "busy-1",
+				NodeID:    node.ID,
+				ModelName: "busy-model",
+				Address:   "10.0.0.1:12345",
+				State:     "loaded",
+			}
+			Expect(db.Create(busy).Error).To(Succeed())
+			Expect(registry.IncrementInFlight(context.Background(), node.ID, "busy-model", 0)).To(Succeed())
+			// Make it stale so only the in-flight guard keeps it from a probe.
+			Expect(db.Model(&NodeModel{}).Where("id = ?", "busy-1").
+				Update("updated_at", time.Now().Add(-5*time.Minute)).Error).To(Succeed())
+
+			prober := &fakeProber{alive: map[string]bool{"10.0.0.1:12345": false}}
+			rc := NewReplicaReconciler(ReplicaReconcilerOptions{
+				Registry: registry, DB: db, Prober: prober, ProbeStaleAfter: 2 * time.Minute,
+			})
+			rc.probeLoadedModels(context.Background())
+
+			var after []NodeModel
+			Expect(db.Find(&after).Error).To(Succeed())
+			Expect(after).To(HaveLen(1), "in-flight model must not be reaped")
+			Expect(prober.calls).To(Equal(0), "in-flight model must not even be probed")
+		})
+
+		It("reaps only after consecutive probe failures reach the threshold", func() {
+			node := &BackendNode{Name: "n1", NodeType: NodeTypeBackend, Address: "10.0.0.1:50051"}
+			Expect(registry.Register(context.Background(), node, true)).To(Succeed())
+			stale := &NodeModel{
+				ID:        "flaky-1",
+				NodeID:    node.ID,
+				ModelName: "flaky-model",
+				Address:   "10.0.0.1:12345",
+				State:     "loaded",
+				UpdatedAt: time.Now().Add(-5 * time.Minute),
+			}
+			Expect(db.Create(stale).Error).To(Succeed())
+			prober := &fakeProber{alive: map[string]bool{"10.0.0.1:12345": false}}
+			rc := NewReplicaReconciler(ReplicaReconcilerOptions{
+				Registry: registry, DB: db, Prober: prober,
+				ProbeStaleAfter: 2 * time.Minute, ProbeFailureThreshold: 3,
+			})
+
+			// First two consecutive failures must NOT reap (a busy backend gets grace).
+			rc.probeLoadedModels(context.Background())
+			rc.probeLoadedModels(context.Background())
+			var mid []NodeModel
+			Expect(db.Find(&mid).Error).To(Succeed())
+			Expect(mid).To(HaveLen(1), "must not reap before the failure threshold")
+
+			// The third consecutive failure reaps.
+			rc.probeLoadedModels(context.Background())
+			var after []NodeModel
+			Expect(db.Find(&after).Error).To(Succeed())
+			Expect(after).To(BeEmpty(), "reaped on the threshold-th consecutive failure")
+		})
+
+		It("resets the failure counter after a successful probe", func() {
+			node := &BackendNode{Name: "n1", NodeType: NodeTypeBackend, Address: "10.0.0.1:50051"}
+			Expect(registry.Register(context.Background(), node, true)).To(Succeed())
+			m := &NodeModel{
+				ID:        "reset-1",
+				NodeID:    node.ID,
+				ModelName: "reset-model",
+				Address:   "10.0.0.1:12345",
+				State:     "loaded",
+				UpdatedAt: time.Now().Add(-5 * time.Minute),
+			}
+			Expect(db.Create(m).Error).To(Succeed())
+			prober := &fakeProber{alive: map[string]bool{"10.0.0.1:12345": false}}
+			rc := NewReplicaReconciler(ReplicaReconcilerOptions{
+				Registry: registry, DB: db, Prober: prober,
+				ProbeStaleAfter: 2 * time.Minute, ProbeFailureThreshold: 3,
+			})
+
+			staleAgain := func() {
+				Expect(db.Model(&NodeModel{}).Where("id = ?", "reset-1").
+					Update("updated_at", time.Now().Add(-5*time.Minute)).Error).To(Succeed())
+			}
+
+			rc.probeLoadedModels(context.Background()) // strike 1
+
+			// Recover: a successful probe must reset the strike counter.
+			prober.alive["10.0.0.1:12345"] = true
+			rc.probeLoadedModels(context.Background())
+
+			// Fail twice more — total < threshold only if the counter reset.
+			prober.alive["10.0.0.1:12345"] = false
+			staleAgain()
+			rc.probeLoadedModels(context.Background()) // post-reset strike 1
+			staleAgain()
+			rc.probeLoadedModels(context.Background()) // post-reset strike 2
+
+			var after []NodeModel
+			Expect(db.Find(&after).Error).To(Succeed())
+			Expect(after).To(HaveLen(1), "successful probe should have reset the counter")
 		})
 	})
 
