@@ -864,8 +864,13 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 **kwargs
             ).images[0]
 
-        # save the result
-        image.save(request.dst)
+        # save the result. Force PNG: in distributed mode the frontend stages
+        # the output to a worker-side temp path with a generic ".tmp" suffix
+        # (core/services/nodes file staging), and PIL's Image.save() infers the
+        # format from the extension -> ".tmp" raises "unknown file extension".
+        # LocalAI image output is always PNG (the non-distributed path appends
+        # ".png"), so pin the format instead of relying on the dst extension.
+        image.save(request.dst, format="PNG")
 
         return backend_pb2.Result(message="Media generated", success=True)
 
