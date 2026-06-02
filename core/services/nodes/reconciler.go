@@ -62,6 +62,15 @@ type ReplicaReconciler struct {
 	// DB row — otherwise a phantom entry lingers until the next request trips
 	// the loader's own consecutive-failure eviction.
 	onReplicaReaped func(modelName string)
+	// probeFailureThreshold: consecutive failed health probes before reaping a
+	// loaded model. Guards against false-positive eviction of a backend that's
+	// merely busy (finishing a cold load, or serving a long request on its
+	// single gRPC handler) and so misses a 1s health ping. Default 3.
+	probeFailureThreshold int
+	// probeFailures tracks consecutive probe failures per node_model ID, reset
+	// on a successful probe or on reap. In-memory: a frontend restart resets
+	// the counters, at worst delaying a reap by a few ticks.
+	probeFailures map[string]int
 }
 
 // ModelScheduler abstracts the scheduling logic needed by the reconciler.
@@ -89,6 +98,9 @@ type ReplicaReconcilerOptions struct {
 	Interval        time.Duration // default 30s
 	ScaleDownDelay  time.Duration // default 5m
 	ProbeStaleAfter time.Duration // default 2m
+	// ProbeFailureThreshold is how many consecutive failed health probes a
+	// loaded model must accrue before being reaped. Default 3.
+	ProbeFailureThreshold int
 }
 
 // NewReplicaReconciler creates a new ReplicaReconciler.
@@ -105,20 +117,26 @@ func NewReplicaReconciler(opts ReplicaReconcilerOptions) *ReplicaReconciler {
 	if probeStaleAfter == 0 {
 		probeStaleAfter = 2 * time.Minute
 	}
+	probeFailureThreshold := opts.ProbeFailureThreshold
+	if probeFailureThreshold == 0 {
+		probeFailureThreshold = 3
+	}
 	prober := opts.Prober
 	if prober == nil {
 		prober = grpcModelProber{token: opts.RegistrationToken}
 	}
 	return &ReplicaReconciler{
-		registry:        opts.Registry,
-		scheduler:       opts.Scheduler,
-		unloader:        opts.Unloader,
-		adapter:         opts.Adapter,
-		prober:          prober,
-		db:              opts.DB,
-		interval:        interval,
-		scaleDownDelay:  scaleDownDelay,
-		probeStaleAfter: probeStaleAfter,
+		registry:              opts.Registry,
+		scheduler:             opts.Scheduler,
+		unloader:              opts.Unloader,
+		adapter:               opts.Adapter,
+		prober:                prober,
+		db:                    opts.DB,
+		interval:              interval,
+		scaleDownDelay:        scaleDownDelay,
+		probeStaleAfter:       probeStaleAfter,
+		probeFailureThreshold: probeFailureThreshold,
+		probeFailures:         map[string]int{},
 	}
 }
 
@@ -296,7 +314,7 @@ func (rc *ReplicaReconciler) probeLoadedModels(ctx context.Context) {
 	cutoff := time.Now().Add(-rc.probeStaleAfter)
 	err := rc.registry.db.WithContext(ctx).
 		Joins("JOIN backend_nodes ON backend_nodes.id = node_models.node_id").
-		Where("node_models.state = ? AND backend_nodes.status = ? AND node_models.updated_at < ? AND node_models.address != ''",
+		Where("node_models.state = ? AND backend_nodes.status = ? AND node_models.updated_at < ? AND node_models.address != '' AND node_models.in_flight = 0",
 			"loaded", StatusHealthy, cutoff).
 		Find(&stale).Error
 	if err != nil {
@@ -308,11 +326,24 @@ func (rc *ReplicaReconciler) probeLoadedModels(ctx context.Context) {
 			return
 		}
 		if rc.prober.IsAlive(ctx, m.Address) {
+			delete(rc.probeFailures, m.ID)
 			// Bump updated_at so we don't probe this row again immediately.
 			_ = rc.registry.db.WithContext(ctx).Model(&NodeModel{}).
 				Where("id = ?", m.ID).Update("updated_at", time.Now()).Error
 			continue
 		}
+		// Unreachable — but don't reap on a single transient miss. A backend
+		// finishing a slow cold load, or busy serving a long request on its
+		// single gRPC handler, legitimately misses a 1s health ping. Only reap
+		// after probeFailureThreshold consecutive failures (reset on success).
+		rc.probeFailures[m.ID]++
+		if rc.probeFailures[m.ID] < rc.probeFailureThreshold {
+			xlog.Debug("Reconciler: model probe failed, deferring reap",
+				"node", m.NodeID, "model", m.ModelName, "replica", m.ReplicaIndex,
+				"failures", rc.probeFailures[m.ID], "threshold", rc.probeFailureThreshold)
+			continue
+		}
+		delete(rc.probeFailures, m.ID)
 		if err := rc.registry.RemoveNodeModel(ctx, m.NodeID, m.ModelName, m.ReplicaIndex); err != nil {
 			xlog.Warn("Reconciler: failed to remove unreachable model", "node", m.NodeID, "model", m.ModelName, "replica", m.ReplicaIndex, "error", err)
 			continue
