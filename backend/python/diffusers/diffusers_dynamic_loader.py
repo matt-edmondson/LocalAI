@@ -29,6 +29,7 @@ Usage:
 """
 
 import importlib
+import os
 import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple, Type
@@ -482,6 +483,17 @@ def load_diffusers_pipeline(
     # Load the pipeline
     try:
         if from_single_file:
+            # from_single_file() loads a single checkpoint file. LocalAI sets
+            # from_single_file=True whenever the resolved model path exists on
+            # disk, but a local diffusers *directory* (a pipeline dir with
+            # model_index.json) must be loaded with from_pretrained() — passing
+            # a directory to from_single_file() fails with "Invalid
+            # `pretrained_model_name_or_path` provided". Route directories
+            # accordingly; local_files_only avoids any Hub round-trip on an
+            # air-gapped host (the caller may override it via kwargs).
+            if os.path.isdir(model_id):
+                kwargs.setdefault('local_files_only', True)
+                return pipeline_class.from_pretrained(model_id, **kwargs)
             # Check if the class has from_single_file method
             if hasattr(pipeline_class, 'from_single_file'):
                 return pipeline_class.from_single_file(model_id, **kwargs)
