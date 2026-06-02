@@ -40,12 +40,26 @@ type DistributedConfig struct {
 	// model-row cleanup on MarkUnhealthy / MarkDraining).
 	DisablePerModelHealthCheck bool
 
-	MCPCIJobTimeout     time.Duration // MCP CI job execution timeout (default 10m)
+	MCPCIJobTimeout time.Duration // MCP CI job execution timeout (default 10m)
+
+	BackendInstallTimeout time.Duration // NATS round-trip timeout for backend.install (default 15m)
+	BackendUpgradeTimeout time.Duration // NATS round-trip timeout for backend.upgrade (default 15m)
 
 	MaxUploadSize int64 // Maximum upload body size in bytes (default 50 GB)
 
 	AgentWorkerConcurrency int `yaml:"agent_worker_concurrency" json:"agent_worker_concurrency" env:"LOCALAI_AGENT_WORKER_CONCURRENCY"`
 	JobWorkerConcurrency   int `yaml:"job_worker_concurrency" json:"job_worker_concurrency" env:"LOCALAI_JOB_WORKER_CONCURRENCY"`
+
+	// PrefixCacheDisabled turns off prefix-cache-aware routing, falling back to
+	// round-robin (the floor). Prefix-cache routing is ON by default in
+	// distributed mode; this flag exists so operators can opt out. The CLI
+	// surfaces a default-true --distributed-prefix-cache enable flag and sets
+	// this when the operator passes --distributed-prefix-cache=false.
+	PrefixCacheDisabled bool
+	// PrefixCacheTTL is the idle-timeout for prefix-cache index entries and
+	// drives the background eviction cadence (eviction runs every TTL/2). Zero
+	// means use the prefixcache package default (5m).
+	PrefixCacheTTL time.Duration
 }
 
 // Validate checks that the distributed configuration is internally consistent.
@@ -68,13 +82,15 @@ func (c DistributedConfig) Validate() error {
 	}
 	// Check for negative durations
 	for name, d := range map[string]time.Duration{
-		"mcp-tool-timeout":      c.MCPToolTimeout,
-		"mcp-discovery-timeout": c.MCPDiscoveryTimeout,
-		"worker-wait-timeout":   c.WorkerWaitTimeout,
-		"drain-timeout":         c.DrainTimeout,
-		"health-check-interval": c.HealthCheckInterval,
-		"stale-node-threshold":  c.StaleNodeThreshold,
-		"mcp-ci-job-timeout":    c.MCPCIJobTimeout,
+		FlagMCPToolTimeout:        c.MCPToolTimeout,
+		FlagMCPDiscoveryTimeout:   c.MCPDiscoveryTimeout,
+		FlagWorkerWaitTimeout:     c.WorkerWaitTimeout,
+		FlagDrainTimeout:          c.DrainTimeout,
+		FlagHealthCheckInterval:   c.HealthCheckInterval,
+		FlagStaleNodeThreshold:    c.StaleNodeThreshold,
+		FlagMCPCIJobTimeout:       c.MCPCIJobTimeout,
+		FlagBackendInstallTimeout: c.BackendInstallTimeout,
+		FlagBackendUpgradeTimeout: c.BackendUpgradeTimeout,
 	} {
 		if d < 0 {
 			return fmt.Errorf("%s must not be negative", name)
@@ -137,23 +153,79 @@ func WithStorageSecretKey(key string) AppOption {
 	}
 }
 
+func WithBackendInstallTimeout(d time.Duration) AppOption {
+	return func(o *ApplicationConfig) {
+		o.Distributed.BackendInstallTimeout = d
+	}
+}
+
+func WithBackendUpgradeTimeout(d time.Duration) AppOption {
+	return func(o *ApplicationConfig) {
+		o.Distributed.BackendUpgradeTimeout = d
+	}
+}
+
 var EnableAutoApproveNodes = func(o *ApplicationConfig) {
 	o.Distributed.AutoApproveNodes = true
 }
 
+// DisablePrefixCache turns off prefix-cache-aware routing (falls back to
+// round-robin). Prefix-cache routing is enabled by default in distributed mode.
+var DisablePrefixCache = func(o *ApplicationConfig) {
+	o.Distributed.PrefixCacheDisabled = true
+}
+
+// WithPrefixCacheTTL sets the prefix-cache index idle-timeout (and the
+// background eviction cadence, which runs every TTL/2).
+func WithPrefixCacheTTL(d time.Duration) AppOption {
+	return func(o *ApplicationConfig) {
+		o.Distributed.PrefixCacheTTL = d
+	}
+}
+
+// Flag names for distributed timeout / interval configuration. These are
+// the kebab-case identifiers kong derives from the matching RunCMD struct
+// fields; they appear in Validate error messages and any other operator-
+// facing surface that needs to reference a specific knob by name. Keeping
+// them as constants prevents the string from drifting from the actual
+// flag a future rename would produce.
+const (
+	FlagMCPToolTimeout        = "mcp-tool-timeout"
+	FlagMCPDiscoveryTimeout   = "mcp-discovery-timeout"
+	FlagWorkerWaitTimeout     = "worker-wait-timeout"
+	FlagDrainTimeout          = "drain-timeout"
+	FlagHealthCheckInterval   = "health-check-interval"
+	FlagStaleNodeThreshold    = "stale-node-threshold"
+	FlagMCPCIJobTimeout       = "mcp-ci-job-timeout"
+	FlagBackendInstallTimeout = "backend-install-timeout"
+	FlagBackendUpgradeTimeout = "backend-upgrade-timeout"
+)
+
 // Defaults for distributed timeouts.
 const (
-	DefaultMCPToolTimeout      = 360 * time.Second
-	DefaultMCPDiscoveryTimeout = 60 * time.Second
-	DefaultWorkerWaitTimeout   = 5 * time.Minute
-	DefaultDrainTimeout        = 30 * time.Second
-	DefaultHealthCheckInterval = 15 * time.Second
-	DefaultStaleNodeThreshold  = 60 * time.Second
-	DefaultMCPCIJobTimeout     = 10 * time.Minute
+	DefaultMCPToolTimeout        = 360 * time.Second
+	DefaultMCPDiscoveryTimeout   = 60 * time.Second
+	DefaultWorkerWaitTimeout     = 5 * time.Minute
+	DefaultDrainTimeout          = 30 * time.Second
+	DefaultHealthCheckInterval   = 15 * time.Second
+	DefaultStaleNodeThreshold    = 60 * time.Second
+	DefaultMCPCIJobTimeout       = 10 * time.Minute
+	DefaultBackendInstallTimeout = 15 * time.Minute
+	DefaultBackendUpgradeTimeout = 15 * time.Minute
 )
 
 // DefaultMaxUploadSize is the default maximum upload body size (50 GB).
 const DefaultMaxUploadSize int64 = 50 << 30
+
+// BackendInstallTimeoutOrDefault returns the configured timeout or the default.
+func (c DistributedConfig) BackendInstallTimeoutOrDefault() time.Duration {
+	return cmp.Or(c.BackendInstallTimeout, DefaultBackendInstallTimeout)
+}
+
+// BackendUpgradeTimeoutOrDefault returns the configured timeout or the default.
+func (c DistributedConfig) BackendUpgradeTimeoutOrDefault() time.Duration {
+	return cmp.Or(c.BackendUpgradeTimeout, DefaultBackendUpgradeTimeout)
+}
 
 // MCPToolTimeoutOrDefault returns the configured timeout or the default.
 func (c DistributedConfig) MCPToolTimeoutOrDefault() time.Duration {
