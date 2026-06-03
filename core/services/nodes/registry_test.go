@@ -1488,4 +1488,17 @@ var _ = Describe("NodeRegistry", func() {
 			Expect(err).To(HaveOccurred())
 		})
 	})
+
+	Describe("NodeGPU migration", func() {
+		It("creates the node_gpus table and round-trips a row", func() {
+			gpu := NodeGPU{NodeID: "node-1", GPUIndex: 0, TotalVRAM: 12_000_000_000, FreeVRAM: 11_000_000_000}
+			Expect(db.Create(&gpu).Error).To(Succeed())
+
+			var got NodeGPU
+			Expect(db.Where("node_id = ? AND gpu_index = ?", "node-1", 0).First(&got).Error).To(Succeed())
+			Expect(got.TotalVRAM).To(Equal(uint64(12_000_000_000)))
+			Expect(got.FreeVRAM).To(Equal(uint64(11_000_000_000)))
+			Expect(got.ReservedVRAM).To(Equal(uint64(0)))
+		})
+	})
 })

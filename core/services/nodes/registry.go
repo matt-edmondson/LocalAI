@@ -95,6 +95,21 @@ type NodeModel struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
+// NodeGPU is one physical GPU on a backend node. Free/total VRAM are refreshed
+// by the worker heartbeat (the worker is the source of truth). ReservedVRAM is
+// the per-GPU soft, in-tick reservation the scheduler deducts when it assigns a
+// model to this GPU; the worker's next heartbeat clears it back to 0.
+type NodeGPU struct {
+	NodeID       string    `gorm:"primaryKey;size:36" json:"node_id"`
+	GPUIndex     int       `gorm:"primaryKey;column:gpu_index" json:"gpu_index"`
+	TotalVRAM    uint64    `gorm:"column:total_vram" json:"total_vram"`
+	FreeVRAM     uint64    `gorm:"column:free_vram" json:"free_vram"`
+	ReservedVRAM uint64    `gorm:"column:reserved_vram;default:0" json:"reserved_vram"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+func (NodeGPU) TableName() string { return "node_gpus" }
+
 // ModelLoadInfo is per-model load metadata kept independently of NodeModel rows
 // so the Replica Reconciler can re-load a model after every replica row has
 // been removed (worker death, eviction, MarkOffline reaping, frontend restart
@@ -263,7 +278,7 @@ func (r *NodeRegistry) nodeModelNames(ctx context.Context, db *gorm.DB, nodeID s
 // when multiple instances (frontend + workers) start at the same time.
 func NewNodeRegistry(db *gorm.DB) (*NodeRegistry, error) {
 	if err := advisorylock.WithLockCtx(context.Background(), db, advisorylock.KeySchemaMigrate, func() error {
-		return db.AutoMigrate(&BackendNode{}, &NodeModel{}, &NodeLabel{}, &ModelSchedulingConfig{}, &PendingBackendOp{}, &ModelLoadInfo{})
+		return db.AutoMigrate(&BackendNode{}, &NodeModel{}, &NodeLabel{}, &ModelSchedulingConfig{}, &PendingBackendOp{}, &ModelLoadInfo{}, &NodeGPU{})
 	}); err != nil {
 		return nil, fmt.Errorf("migrating node tables: %w", err)
 	}
