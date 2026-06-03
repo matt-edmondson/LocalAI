@@ -124,6 +124,12 @@ func (f *fakeModelRouterForSmartRouter) FindNodesWithModel(_ context.Context, _ 
 func (f *fakeModelRouterForSmartRouter) LoadedReplicaStats(_ context.Context, _ string, _ []string) ([]ReplicaCandidate, error) {
 	return nil, nil
 }
+func (f *fakeModelRouterForSmartRouter) GetModelVRAMEstimate(_ context.Context, _ string) (*ModelVRAMEstimate, error) {
+	return nil, fmt.Errorf("not found")
+}
+func (f *fakeModelRouterForSmartRouter) UpsertModelVRAMEstimate(_ context.Context, _, _ string, _ uint64, _ string, _ int) error {
+	return nil
+}
 
 // Compile-time check
 var _ ModelRouter = (*fakeModelRouterForSmartRouter)(nil)

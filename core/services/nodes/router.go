@@ -903,15 +903,24 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 }
 
 // estimateModelVRAM estimates the VRAM required for a model using the unified estimator.
+// Precedence: (1) measured/cached estimate, (2) GGUF/HF metadata, (3) file-size heuristic.
 func (r *SmartRouter) estimateModelVRAM(ctx context.Context, opts *pb.ModelOptions) uint64 {
 	estCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+
+	// 1. Measured/cached estimate wins (set after a real load).
+	if opts.Model != "" {
+		if cached, err := r.registry.GetModelVRAMEstimate(ctx, opts.Model); err == nil && cached.VRAMBytes > 0 {
+			return cached.VRAMBytes
+		}
+	}
 
 	ctxSize := uint32(opts.ContextSize)
 	if ctxSize == 0 {
 		ctxSize = 8192
 	}
 
+	// 2. Metadata estimate (GGUF / HF repo) for parseable models.
 	input := vram.ModelEstimateInput{
 		Options: vram.EstimateOptions{
 			GPULayers: int(opts.NGPULayers),
@@ -932,15 +941,24 @@ func (r *SmartRouter) estimateModelVRAM(ctx context.Context, opts *pb.ModelOptio
 		}
 	}
 
-	if len(input.Files) == 0 && input.HFRepo == "" && input.Size == "" {
-		return 0
+	if len(input.Files) > 0 || input.HFRepo != "" || input.Size != "" {
+		if result, err := vram.EstimateModelMultiContext(estCtx, input, []uint32{ctxSize}); err == nil {
+			if v := result.VRAMForContext(ctxSize); v > 0 {
+				return v
+			}
+		}
 	}
 
-	result, err := vram.EstimateModelMultiContext(estCtx, input, []uint32{ctxSize})
-	if err != nil {
-		return 0
+	// 3. File-size heuristic for unparseable models (diffusers/SDXL). Seed the
+	//    cache so subsequent placements are consistent until a measured value
+	//    replaces it.
+	heur := vram.EstimateHeuristic(opts.ModelFile)
+	if heur > 0 && opts.Model != "" {
+		if err := r.registry.UpsertModelVRAMEstimate(ctx, opts.Model, "", heur, "heuristic", 1); err != nil {
+			xlog.Debug("failed to seed heuristic VRAM estimate", "model", opts.Model, "error", err)
+		}
 	}
-	return result.VRAMForContext(ctxSize)
+	return heur
 }
 
 // installBackendOnNode sends a NATS backend.install request-reply to the node

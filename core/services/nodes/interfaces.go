@@ -38,6 +38,8 @@ type ModelRouter interface {
 	GetNodeLabels(ctx context.Context, nodeID string) ([]NodeLabel, error)
 	FindNodesWithModel(ctx context.Context, modelName string) ([]BackendNode, error)
 	LoadedReplicaStats(ctx context.Context, modelName string, candidateNodeIDs []string) ([]ReplicaCandidate, error)
+	GetModelVRAMEstimate(ctx context.Context, modelName string) (*ModelVRAMEstimate, error)
+	UpsertModelVRAMEstimate(ctx context.Context, modelName, backend string, bytes uint64, source string, gpuCount int) error
 }
 
 // ConcurrencyConflictResolver returns the names of configured models that

@@ -127,6 +127,9 @@ type fakeModelRouter struct {
 	// Preferences passed to FindAndLockNodeWithModel, in call order. nil
 	// entries are recorded too, so tests can assert "preference was nil".
 	findAndLockPrefs []*RoutePreference
+
+	// GetModelVRAMEstimate returns this value when non-nil; gorm.ErrRecordNotFound otherwise.
+	vramEstimate *ModelVRAMEstimate
 }
 
 func (f *fakeModelRouter) FindAndLockNodeWithModel(_ context.Context, modelName string, _ []string, pref *RoutePreference) (*BackendNode, *NodeModel, error) {
@@ -260,6 +263,17 @@ func (f *fakeModelRouter) FindNodesWithModel(_ context.Context, modelName string
 		return nil, f.findNodesWithModelErr
 	}
 	return f.findNodesWithModelByName[modelName], nil
+}
+
+func (f *fakeModelRouter) GetModelVRAMEstimate(_ context.Context, _ string) (*ModelVRAMEstimate, error) {
+	if f.vramEstimate == nil {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return f.vramEstimate, nil
+}
+
+func (f *fakeModelRouter) UpsertModelVRAMEstimate(_ context.Context, _, _ string, _ uint64, _ string, _ int) error {
+	return nil
 }
 
 // fakeConflictResolver implements ConcurrencyConflictResolver from a static map.
@@ -832,6 +846,25 @@ var _ = Describe("SmartRouter", func() {
 			Expect(err.Error()).To(ContainSubstring("never-loaded"))
 			Expect(unloader.installCalls).To(BeEmpty(),
 				"reconciler must not fire backend.install when there is no load info to replicate")
+		})
+	})
+
+	// -----------------------------------------------------------------------
+	// estimateModelVRAM unit tests (mock-based)
+	// -----------------------------------------------------------------------
+	Describe("estimateModelVRAM", func() {
+		It("returns the cached measured estimate when present in the registry", func() {
+			reg := &fakeModelRouter{
+				vramEstimate: &ModelVRAMEstimate{
+					ModelName: "m",
+					VRAMBytes: 7_000_000_000,
+					Source:    "measured",
+				},
+			}
+			router := NewSmartRouter(reg, SmartRouterOptions{})
+
+			got := router.estimateModelVRAM(context.Background(), &pb.ModelOptions{Model: "m"})
+			Expect(got).To(Equal(uint64(7_000_000_000)))
 		})
 	})
 
