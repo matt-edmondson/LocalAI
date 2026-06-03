@@ -4,7 +4,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // Heuristic constants. Weights are typically already stored in their runtime
@@ -17,15 +16,6 @@ const (
 	heuristicFixedOverhead   = uint64(2) << 30 // 2 GiB
 	heuristicMinimumEstimate = uint64(1) << 30 // never return less than 1 GiB for a GPU model
 )
-
-var weightExtensions = map[string]bool{
-	".safetensors": true,
-	".bin":         true,
-	".pt":          true,
-	".pth":         true,
-	".ckpt":        true,
-	".gguf":        true,
-}
 
 // EstimateHeuristic sizes a model from its on-disk weights when metadata-based
 // estimation is unavailable. modelPath may be a single weight file or a model
@@ -43,7 +33,7 @@ func EstimateHeuristic(modelPath string) uint64 {
 			if err != nil || d.IsDir() {
 				return nil
 			}
-			if weightExtensions[strings.ToLower(filepath.Ext(p))] {
+			if IsWeightFile(p) {
 				if info, e := d.Info(); e == nil {
 					weightBytes += uint64(info.Size())
 				}
