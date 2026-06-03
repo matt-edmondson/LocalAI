@@ -119,6 +119,27 @@ type SmartRouter struct {
 	// load before sampling the post-load snapshot.
 	measureSettleAttempts int
 	measureSettleDelay    time.Duration
+	// remoteLoadTimeout bounds the LoadModel gRPC call to a remote backend.
+	// Cold loads of large models (file staging + python venv warmup +
+	// safetensors load + CUDA init) routinely exceed the previous 5m value.
+	// Override with LOCALAI_REMOTE_LOAD_TIMEOUT (Go duration, e.g. "30m").
+	remoteLoadTimeout time.Duration
+}
+
+// defaultRemoteLoadTimeout matches the NATS backend-install timeout default —
+// the other long-pole in the same load path.
+const defaultRemoteLoadTimeout = 15 * time.Minute
+
+// remoteLoadTimeoutFromEnv returns LOCALAI_REMOTE_LOAD_TIMEOUT when it parses
+// as a positive Go duration, else defaultRemoteLoadTimeout.
+func remoteLoadTimeoutFromEnv() time.Duration {
+	if v := os.Getenv("LOCALAI_REMOTE_LOAD_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+		xlog.Warn("Invalid LOCALAI_REMOTE_LOAD_TIMEOUT, using default", "value", v, "default", defaultRemoteLoadTimeout)
+	}
+	return defaultRemoteLoadTimeout
 }
 
 // probeCacheTTL is how long a successful gRPC HealthCheck on a backend is
@@ -159,6 +180,7 @@ func NewSmartRouter(registry ModelRouter, opts SmartRouterOptions) *SmartRouter 
 	}
 	r.measureSettleAttempts = 3
 	r.measureSettleDelay = 6 * time.Second
+	r.remoteLoadTimeout = remoteLoadTimeoutFromEnv()
 	return r
 }
 
@@ -327,7 +349,7 @@ func (r *SmartRouter) scheduleAndLoad(ctx context.Context, backendType, tracking
 	if loadOpts != nil {
 		xlog.Info("Loading model on remote node", "node", node.Name, "model", modelName, "addr", backendAddr)
 
-		loadCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		loadCtx, cancel := context.WithTimeout(ctx, r.remoteLoadTimeout)
 		defer cancel()
 
 		res, err := client.LoadModel(loadCtx, loadOpts)
