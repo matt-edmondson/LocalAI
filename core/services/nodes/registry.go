@@ -88,9 +88,10 @@ type NodeModel struct {
 	State         string    `gorm:"size:32;default:idle" json:"state"` // loading, loaded, unloading, idle
 	InFlight      int       `json:"in_flight"`                         // number of active requests on this replica
 	LastUsed      time.Time `json:"last_used"`
-	LoadingBy     string    `gorm:"size:36" json:"loading_by,omitempty"`    // frontend ID that triggered loading
-	BackendType   string    `gorm:"size:128" json:"backend_type,omitempty"` // e.g. "llama-cpp"; used by reconciler to replicate loads
-	ModelOptsBlob []byte    `gorm:"type:bytea" json:"-"`                    // serialized pb.ModelOptions for replica scale-ups
+	LoadingBy     string    `gorm:"size:36" json:"loading_by,omitempty"`                     // frontend ID that triggered loading
+	BackendType   string    `gorm:"size:128" json:"backend_type,omitempty"`                  // e.g. "llama-cpp"; used by reconciler to replicate loads
+	ModelOptsBlob []byte    `gorm:"type:bytea" json:"-"`                                     // serialized pb.ModelOptions for replica scale-ups
+	GPUIndices    string    `gorm:"column:gpu_indices;size:64" json:"gpu_indices,omitempty"` // CSV of assigned physical GPU indices
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
@@ -614,6 +615,21 @@ func (r *NodeRegistry) NodeGPUs(ctx context.Context, nodeID string) ([]NodeGPU, 
 	return gpus, err
 }
 
+// CandidateNodesByFreeVRAM returns healthy backend nodes (optionally filtered to
+// nodeIDs) ordered by effectively-free node-level VRAM (available - reserved)
+// descending. The per-GPU placement loop walks this order and asks planGPUSet
+// to fit a model on the most-free node first.
+func (r *NodeRegistry) CandidateNodesByFreeVRAM(ctx context.Context, nodeIDs []string) ([]BackendNode, error) {
+	q := r.db.WithContext(ctx).
+		Where("status = ? AND node_type = ?", StatusHealthy, NodeTypeBackend)
+	if len(nodeIDs) > 0 {
+		q = q.Where("id IN ?", nodeIDs)
+	}
+	var nodes []BackendNode
+	err := q.Order("(available_vram - reserved_vram) DESC").Find(&nodes).Error
+	return nodes, err
+}
+
 // GetModelVRAMEstimate returns the cached estimate for a model, or
 // gorm.ErrRecordNotFound if none exists.
 func (r *NodeRegistry) GetModelVRAMEstimate(ctx context.Context, modelName string) (*ModelVRAMEstimate, error) {
@@ -853,7 +869,7 @@ func (r *NodeRegistry) FindStaleNodes(ctx context.Context, threshold time.Durati
 // SetNodeModel records that a replica of a model is loaded on a node.
 // replicaIndex identifies which slot on the node this replica occupies
 // (0..MaxReplicasPerModel-1). Pass 0 for single-replica scheduling.
-func (r *NodeRegistry) SetNodeModel(ctx context.Context, nodeID, modelName string, replicaIndex int, state, address string, initialInFlight int) error {
+func (r *NodeRegistry) SetNodeModel(ctx context.Context, nodeID, modelName string, replicaIndex int, state, address string, initialInFlight int, gpuIndices string) error {
 	now := time.Now()
 	// Use Attrs for creation-only fields (ID) and Assign for update-only fields.
 	// Attrs is applied only when creating a new record. Assign is applied on
@@ -862,7 +878,7 @@ func (r *NodeRegistry) SetNodeModel(ctx context.Context, nodeID, modelName strin
 	var nm NodeModel
 	result := r.db.WithContext(ctx).Where("node_id = ? AND model_name = ? AND replica_index = ?", nodeID, modelName, replicaIndex).
 		Attrs(NodeModel{ID: uuid.New().String(), NodeID: nodeID, ModelName: modelName, ReplicaIndex: replicaIndex}).
-		Assign(map[string]any{"address": address, "state": state, "last_used": now, "in_flight": initialInFlight}).
+		Assign(map[string]any{"address": address, "state": state, "last_used": now, "in_flight": initialInFlight, "gpu_indices": gpuIndices}).
 		FirstOrCreate(&nm)
 	return result.Error
 }

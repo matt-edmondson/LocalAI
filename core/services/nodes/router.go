@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -160,6 +161,10 @@ type scheduleLoadResult struct {
 	Client       grpc.Backend
 	BackendAddr  string
 	ReplicaIndex int
+	// GPUSet is the set of physical GPU indices the model was pinned to (empty
+	// for legacy/CPU placement). Task 4.1 uses this to measure the per-GPU
+	// footprint after a successful load.
+	GPUSet []int
 }
 
 // scheduleAndLoad is the shared core for loading a model on a new node.
@@ -172,7 +177,7 @@ type scheduleLoadResult struct {
 func (r *SmartRouter) scheduleAndLoad(ctx context.Context, backendType, trackingKey, modelName string,
 	modelOpts *pb.ModelOptions, parallel bool, initialInFlight int) (*scheduleLoadResult, error) {
 
-	node, backendAddr, replicaIndex, err := r.scheduleNewModel(ctx, backendType, trackingKey, modelOpts)
+	node, backendAddr, replicaIndex, gpuSet, err := r.scheduleNewModel(ctx, backendType, trackingKey, modelOpts)
 	if err != nil {
 		return nil, fmt.Errorf("no available nodes: %w", err)
 	}
@@ -186,6 +191,11 @@ func (r *SmartRouter) scheduleAndLoad(ctx context.Context, backendType, tracking
 		}
 		loadOpts = staged
 	}
+
+	// Set the multi-GPU knob to match the assigned GPU-set size. The worker's
+	// CUDA_VISIBLE_DEVICES pin already restricts the process to gpuSet, so the
+	// backend sees them as 0..K-1. No-op for single-GPU/legacy placement.
+	applyGPUSet(loadOpts, len(gpuSet))
 
 	client := r.buildClientForAddr(node, backendAddr, parallel)
 
@@ -205,8 +215,10 @@ func (r *SmartRouter) scheduleAndLoad(ctx context.Context, backendType, tracking
 		}
 	}
 
-	// Record the model as loaded on this node (specific replica slot).
-	if err := r.registry.SetNodeModel(ctx, node.ID, trackingKey, replicaIndex, "loaded", backendAddr, initialInFlight); err != nil {
+	// Record the model as loaded on this node (specific replica slot), stamping
+	// the assigned physical GPU indices so observability and reconciliation can
+	// see which cards this replica occupies.
+	if err := r.registry.SetNodeModel(ctx, node.ID, trackingKey, replicaIndex, "loaded", backendAddr, initialInFlight, gpuIndicesCSV(gpuSet)); err != nil {
 		xlog.Warn("Failed to record model on node", "node", node.Name, "model", trackingKey, "replica", replicaIndex, "error", err)
 	}
 
@@ -225,7 +237,7 @@ func (r *SmartRouter) scheduleAndLoad(ctx context.Context, backendType, tracking
 		}
 	}
 
-	return &scheduleLoadResult{Node: node, Client: client, BackendAddr: backendAddr, ReplicaIndex: replicaIndex}, nil
+	return &scheduleLoadResult{Node: node, Client: client, BackendAddr: backendAddr, ReplicaIndex: replicaIndex, GPUSet: gpuSet}, nil
 }
 
 // ScheduleAndLoadModel implements ModelScheduler for the reconciler.
@@ -675,16 +687,50 @@ func (r *SmartRouter) nodeMatchesScheduling(ctx context.Context, node *BackendNo
 	return true
 }
 
+// gpuIndicesCSV renders assigned indices for storage on the NodeModel row.
+func gpuIndicesCSV(idx []int) string {
+	parts := make([]string, len(idx))
+	for i, v := range idx {
+		parts[i] = strconv.Itoa(v)
+	}
+	return strings.Join(parts, ",")
+}
+
+// applyGPUSet sets the backend's multi-GPU knob to match the assigned GPU
+// count. CUDA_VISIBLE_DEVICES already restricts the process to these cards, so
+// the backend sees them as 0..K-1. K=1 leaves single-device behavior. An
+// explicit TensorParallelSize already larger than K in the config is respected
+// (the operator asked for more parallelism).
+func applyGPUSet(opts *pb.ModelOptions, k int) {
+	if opts == nil || k < 1 {
+		return
+	}
+	if int(opts.TensorParallelSize) < k {
+		opts.TensorParallelSize = int32(k)
+	}
+	if k > 1 && opts.TensorSplit == "" {
+		even := make([]string, k)
+		for i := range even {
+			even[i] = "1"
+		}
+		opts.TensorSplit = strings.Join(even, ",")
+	}
+}
+
 // scheduleNewModel picks the best node for loading a new model and allocates
 // the replica slot.
-// Strategy: filter to nodes with a free slot for this model → VRAM-aware →
-// idle-first → least-loaded → eviction.
+// Strategy: filter to nodes with a free slot for this model → per-GPU placement
+// (best-fit single GPU / fewest-GPU spanning, with an estimate==0 liveness
+// fallback) → eviction. The legacy node-level VRAM path is kept for
+// mixed-version clusters where no node has reported per-GPU data yet.
 // Sends backend.install via NATS so the chosen node has the right backend running.
 //
-// Returns (node, gRPC address, replicaIndex, err). replicaIndex is the slot
-// the worker has been told to use; the caller must pass the same index into
-// SetNodeModel so the registry row matches the live process.
-func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID string, modelOpts *pb.ModelOptions) (*BackendNode, string, int, error) {
+// Returns (node, gRPC address, replicaIndex, gpuSet, err). replicaIndex is the
+// slot the worker has been told to use; the caller must pass the same index
+// into SetNodeModel so the registry row matches the live process. gpuSet is the
+// set of physical GPU indices the model was pinned to (empty when no per-GPU
+// data was available, i.e. legacy/CPU placement).
+func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID string, modelOpts *pb.ModelOptions) (*BackendNode, string, int, []int, error) {
 	// Estimate VRAM required for the model
 	var estimatedVRAM uint64
 	if modelOpts != nil {
@@ -697,7 +743,7 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 	sched, _ := r.registry.GetModelScheduling(ctx, modelID)
 	candidateNodeIDs, err := r.resolveSelectorCandidates(ctx, modelID, sched)
 	if err != nil {
-		return nil, "", 0, err
+		return nil, "", 0, nil, err
 	}
 
 	// Apply concurrency-group anti-affinity (#9659): prefer nodes that don't
@@ -706,7 +752,7 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 	// per-node watchdog evicts on arrival.
 	candidateNodeIDs, err = r.narrowByGroupAntiAffinity(ctx, modelID, candidateNodeIDs)
 	if err != nil {
-		return nil, "", 0, err
+		return nil, "", 0, nil, err
 	}
 
 	// Narrow candidates to nodes that still have a free replica slot for this
@@ -725,58 +771,99 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 	// it was — we'll fall through to eviction below.
 
 	var node *BackendNode
+	var gpuSet []int
 
-	// VRAM-aware scheduling: when we have a model size estimate, restrict
-	// scheduling to nodes that can actually fit it. The FindIdleNode /
-	// FindLeastLoadedNode fallbacks below ignore VRAM and will happily pick
-	// a node that's about to OOM, so we skip them when the VRAM filter ran
-	// and returned nothing — eviction is the correct next step.
-	vramFilteredOut := false
-	if estimatedVRAM > 0 {
-		if candidateNodeIDs != nil {
-			node, err = r.registry.FindNodeWithVRAMFromSet(ctx, estimatedVRAM, candidateNodeIDs)
-		} else {
-			node, err = r.registry.FindNodeWithVRAM(ctx, estimatedVRAM)
-		}
-		if err != nil {
-			xlog.Info("No node has enough free VRAM; deferring to eviction",
-				"required_vram", vram.FormatBytes(estimatedVRAM), "error", err)
-			vramFilteredOut = true
+	// Per-GPU placement: pick a node AND a GPU set on it. Iterate candidate
+	// nodes ordered by most effective-free node-level VRAM; ask planGPUSet to
+	// fit the model on one GPU (best-fit) or span the fewest GPUs. sawPerGPUNode
+	// records whether ANY candidate reported per-GPU data, which decides whether
+	// the legacy node-level fallbacks below are safe to consult.
+	sawPerGPUNode := false
+	nodesOrdered, nodesErr := r.registry.CandidateNodesByFreeVRAM(ctx, candidateNodeIDs)
+	if nodesErr != nil {
+		xlog.Warn("Failed to list candidate nodes by free VRAM; falling back to legacy placement",
+			"model", modelID, "error", nodesErr)
+	} else {
+		for i := range nodesOrdered {
+			cand := &nodesOrdered[i]
+			gpus, gerr := r.registry.NodeGPUs(ctx, cand.ID)
+			if gerr != nil || len(gpus) == 0 {
+				continue // node hasn't reported per-GPU data yet (e.g. old worker)
+			}
+			sawPerGPUNode = true
+			if estimatedVRAM > 0 {
+				if set, ok := planGPUSet(gpus, estimatedVRAM); ok {
+					node = cand
+					gpuSet = set
+					break
+				}
+			} else {
+				// Unknown estimate (e.g. diffusers files not stat-able on the
+				// frontend): preserve liveness — pin to the single largest-free
+				// GPU on the most-free node. No reservation (we don't know the
+				// size). This still fixes the cuda:0 pile-up. nodesOrdered is
+				// sorted by node free VRAM, so the first node we reach is best.
+				if gi, ok := largestFreeGPU(gpus); ok {
+					node = cand
+					gpuSet = []int{gi}
+					break
+				}
+			}
 		}
 	}
 
-	// Only consult the VRAM-unaware fallback when we didn't have (or couldn't
-	// compute) a VRAM estimate. Otherwise a node we KNOW is too small would
-	// silently get picked here and OOM at load time.
-	if node == nil && !vramFilteredOut {
-		if candidateNodeIDs != nil {
-			node, err = r.registry.FindIdleNodeFromSet(ctx, candidateNodeIDs)
-			if err != nil {
-				node, err = r.registry.FindLeastLoadedNodeFromSet(ctx, candidateNodeIDs)
+	// Mixed-version safety (spec §8): if NO candidate node reported per-GPU
+	// data, fall back to the legacy node-level placement. gpuSet stays empty so
+	// the worker gets no CUDA_VISIBLE_DEVICES pin (pre-change behavior).
+	//
+	// estimatedVRAM > 0: restrict to nodes that can fit it (FindNodeWithVRAM);
+	// don't let the VRAM-blind idle/least-loaded fallbacks pick a known-too-small
+	// node that would OOM. Eviction is the correct next step if none fits.
+	//
+	// estimatedVRAM == 0: we can't size the model, so liveness wins — pick an
+	// idle (then least-loaded) node exactly as before this change. This MUST
+	// never hard-fail; it's the path the Notes/risks section guards.
+	if node == nil && !sawPerGPUNode {
+		if estimatedVRAM > 0 {
+			if candidateNodeIDs != nil {
+				node, _ = r.registry.FindNodeWithVRAMFromSet(ctx, estimatedVRAM, candidateNodeIDs)
+			} else {
+				node, _ = r.registry.FindNodeWithVRAM(ctx, estimatedVRAM)
+			}
+			if node == nil {
+				xlog.Info("No node has enough free VRAM; deferring to eviction",
+					"required_vram", vram.FormatBytes(estimatedVRAM))
 			}
 		} else {
-			node, err = r.registry.FindIdleNode(ctx)
-			if err != nil {
-				node, err = r.registry.FindLeastLoadedNode(ctx)
+			if candidateNodeIDs != nil {
+				node, err = r.registry.FindIdleNodeFromSet(ctx, candidateNodeIDs)
+				if err != nil {
+					node, _ = r.registry.FindLeastLoadedNodeFromSet(ctx, candidateNodeIDs)
+				}
+			} else {
+				node, err = r.registry.FindIdleNode(ctx)
+				if err != nil {
+					node, _ = r.registry.FindLeastLoadedNode(ctx)
+				}
 			}
 		}
 	}
 
-	// 4. Preemptive eviction: if no suitable node found, evict the LRU model
-	//    with zero in-flight.
+	// 4. Preemptive eviction: if no node + GPU set fit, evict the LRU model
+	//    with zero in-flight, then re-plan on the freed node.
 	//
 	//    Two failure modes need handling beyond a single eviction call:
 	//      - "All models busy" (ErrEvictionBusy) — retry briefly. The typical
 	//        pattern is a chat completion finishing right after we tried,
 	//        freeing the model for eviction on the next pass.
 	//      - "Evicted but freed node still doesn't fit" — the global LRU is on
-	//        a node that even after the unload doesn't have enough free VRAM
-	//        for our model. Without this guard, picking that node and running
-	//        LoadModel would OOM. Evict more (a different LRU) until the node
-	//        passes the VRAM filter or we exhaust candidates.
+	//        a node that even after the unload doesn't have a GPU set that fits
+	//        our model. Without this guard, picking that node and running
+	//        LoadModel would OOM. Evict more (a different LRU) until a GPU set
+	//        fits or we exhaust candidates.
 	//
 	//    Eviction releases VRAM physically only after the worker handles the
-	//    NATS unload and its next heartbeat refreshes available_vram in the
+	//    NATS unload and its next heartbeat refreshes per-GPU free_vram in the
 	//    registry — typically <1× HeartbeatInterval. We poll for a short
 	//    window before deciding the node still doesn't fit.
 	if node == nil {
@@ -792,52 +879,69 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 			evictedNode, evictErr := r.evictLRUAndFreeNode(ctx)
 			if evictErr != nil {
 				if !errors.Is(evictErr, ErrEvictionBusy) {
-					return nil, "", 0, fmt.Errorf("no healthy nodes available and eviction failed: %w", evictErr)
+					return nil, "", 0, nil, fmt.Errorf("no healthy nodes available and eviction failed: %w", evictErr)
 				}
 				// Busy — wait briefly and try again. Honour context cancellation.
 				select {
 				case <-time.After(evictionBusyDelay):
 					continue
 				case <-ctx.Done():
-					return nil, "", 0, fmt.Errorf("eviction interrupted: %w", ctx.Err())
+					return nil, "", 0, nil, fmt.Errorf("eviction interrupted: %w", ctx.Err())
 				}
 			}
 
-			// If we have a VRAM estimate, verify the evicted node now fits
-			// the model. Poll briefly since the worker's heartbeat is what
-			// refreshes available_vram after the physical unload completes.
-			if estimatedVRAM > 0 {
-				fits := false
-				for poll := 0; poll < postEvictPollAttempts; poll++ {
+			// Poll the freed node's per-GPU data to let the worker's heartbeat
+			// refresh free_vram after the physical unload, then re-plan. Fall
+			// back to node-level fit only when the freed node never reported
+			// per-GPU data (mixed-version).
+			fits := false
+			for poll := 0; poll < postEvictPollAttempts; poll++ {
+				gpus, gerr := r.registry.NodeGPUs(ctx, evictedNode.ID)
+				if gerr == nil && len(gpus) > 0 {
+					if estimatedVRAM > 0 {
+						if set, ok := planGPUSet(gpus, estimatedVRAM); ok {
+							node, gpuSet = evictedNode, set
+							fits = true
+							break
+						}
+					} else if gi, ok := largestFreeGPU(gpus); ok {
+						node, gpuSet = evictedNode, []int{gi}
+						fits = true
+						break
+					}
+				} else if estimatedVRAM > 0 {
+					// No per-GPU data on the freed node: legacy node-level check.
 					candidate, vramErr := r.registry.FindNodeWithVRAMFromSet(ctx, estimatedVRAM, []string{evictedNode.ID})
 					if vramErr == nil && candidate != nil {
 						node = candidate
 						fits = true
 						break
 					}
-					select {
-					case <-time.After(postEvictPollDelay):
-					case <-ctx.Done():
-						return nil, "", 0, fmt.Errorf("eviction VRAM-recheck interrupted: %w", ctx.Err())
-					}
+				} else {
+					// Unknown estimate, no per-GPU data: the freed node is fine.
+					node = evictedNode
+					fits = true
+					break
 				}
-				if !fits {
-					// The evicted node still doesn't fit. Try evicting another
-					// LRU; on the next outer iteration evictLRUAndFreeNode
-					// picks a different (now-LRU) model.
-					xlog.Info("Evicted node still lacks VRAM, evicting again",
-						"node", evictedNode.Name,
-						"required_vram", vram.FormatBytes(estimatedVRAM))
-					continue
+				select {
+				case <-time.After(postEvictPollDelay):
+				case <-ctx.Done():
+					return nil, "", 0, nil, fmt.Errorf("eviction VRAM-recheck interrupted: %w", ctx.Err())
 				}
-			} else {
-				node = evictedNode
 			}
-			break
+			if fits {
+				break
+			}
+			// The evicted node still doesn't fit. Try evicting another LRU; on
+			// the next outer iteration evictLRUAndFreeNode picks a different
+			// (now-LRU) model.
+			xlog.Info("Evicted node still lacks a fitting GPU set, evicting again",
+				"node", evictedNode.Name,
+				"required_vram", vram.FormatBytes(estimatedVRAM))
 		}
 
 		if node == nil {
-			return nil, "", 0, fmt.Errorf("eviction could not free a node with %s VRAM for model %s",
+			return nil, "", 0, nil, fmt.Errorf("eviction could not free a node with %s VRAM for model %s",
 				vram.FormatBytes(estimatedVRAM), modelID)
 		}
 	}
@@ -858,48 +962,65 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 			"node", node.Name, "model", modelID, "max_slots", maxSlots)
 		evictedNode, evictErr := r.evictLRUAndFreeNode(ctx)
 		if evictErr != nil {
-			return nil, "", 0, fmt.Errorf("no replica slot on %s and eviction failed: %w", node.Name, evictErr)
+			return nil, "", 0, nil, fmt.Errorf("no replica slot on %s and eviction failed: %w", node.Name, evictErr)
 		}
 		node = evictedNode
 		replicaIdx, slotErr = r.registry.NextFreeReplicaIndex(ctx, node.ID, modelID, node.MaxReplicasPerModel)
 		if slotErr != nil {
-			return nil, "", 0, fmt.Errorf("no replica slot on %s after eviction: %w", node.Name, slotErr)
+			return nil, "", 0, nil, fmt.Errorf("no replica slot on %s after eviction: %w", node.Name, slotErr)
+		}
+		// We moved to a different node; the GPU set planned for the previous
+		// node no longer applies. Re-plan against the freed node's per-GPU data
+		// (best-effort; empty gpuSet means no pin, which is the legacy behavior).
+		gpuSet = nil
+		if gpus, gerr := r.registry.NodeGPUs(ctx, node.ID); gerr == nil && len(gpus) > 0 {
+			if estimatedVRAM > 0 {
+				if set, ok := planGPUSet(gpus, estimatedVRAM); ok {
+					gpuSet = set
+				}
+			} else if gi, ok := largestFreeGPU(gpus); ok {
+				gpuSet = []int{gi}
+			}
 		}
 	}
 
-	// Soft-reserve VRAM up front so a second scheduling tick within the same
-	// heartbeat window can't pick this node based on stale free-VRAM
-	// numbers. The worker's next heartbeat resets reserved_vram to the
-	// authoritative reading; explicit rollback below covers the failure
-	// window between reservation and a successful install.
-	reserved := false
-	if estimatedVRAM > 0 {
-		reserveErr := r.registry.ReserveVRAM(ctx, node.ID, estimatedVRAM)
-		if reserveErr != nil {
-			// ErrInsufficientVRAM races with another scheduler — log and
-			// proceed without a reservation rather than failing the load.
-			// FindNodeWithVRAM already accounted for reserved_vram, so this
-			// is a tight race window; the worker will reconcile via heartbeat.
-			xlog.Warn("Failed to reserve VRAM, proceeding without reservation",
-				"node", node.Name, "bytes", estimatedVRAM, "error", reserveErr)
-		} else {
-			reserved = true
+	// Per-GPU soft reservation: deduct ~estimate/len(gpuSet) on each assigned
+	// GPU so a second scheduling tick within the same heartbeat window can't
+	// pick the same GPU based on stale free numbers. The worker's next heartbeat
+	// resets reserved_vram to the authoritative reading; explicit rollback below
+	// covers the failure window between reservation and a successful install.
+	// Only reserve when we have both a GPU set and a real estimate.
+	reservedGPUs := []int{}
+	var perGPUReserve uint64
+	if len(gpuSet) > 0 && estimatedVRAM > 0 {
+		perGPUReserve = estimatedVRAM / uint64(len(gpuSet))
+		for _, gi := range gpuSet {
+			if err := r.registry.ReserveVRAMOnGPU(ctx, node.ID, gi, perGPUReserve); err != nil {
+				// Races with another scheduler — log and proceed without a
+				// reservation rather than failing the load. The worker will
+				// reconcile via heartbeat.
+				xlog.Warn("Per-GPU reservation failed, proceeding without it",
+					"node", node.Name, "gpu", gi, "bytes", perGPUReserve, "error", err)
+			} else {
+				reservedGPUs = append(reservedGPUs, gi)
+			}
 		}
 	}
 
 	// Send backend.install — the worker installs the backend if needed and
-	// starts the gRPC process bound to a port for this (model, replica) slot.
-	addr, installErr := r.installBackendOnNode(ctx, node, backendType, modelID, replicaIdx, nil)
+	// starts the gRPC process bound to a port for this (model, replica) slot,
+	// pinned to gpuSet via CUDA_VISIBLE_DEVICES.
+	addr, installErr := r.installBackendOnNode(ctx, node, backendType, modelID, replicaIdx, gpuSet)
 	if installErr != nil {
-		// Roll back the reservation explicitly so the column is accurate
+		// Roll back per-GPU reservations explicitly so the columns are accurate
 		// before the next heartbeat. Best-effort.
-		if reserved {
-			_ = r.registry.ReleaseVRAM(ctx, node.ID, estimatedVRAM)
+		for _, gi := range reservedGPUs {
+			_ = r.registry.ReleaseVRAMOnGPU(ctx, node.ID, gi, perGPUReserve)
 		}
-		return nil, "", 0, fmt.Errorf("installing backend on node %s: %w", node.Name, installErr)
+		return nil, "", 0, nil, fmt.Errorf("installing backend on node %s: %w", node.Name, installErr)
 	}
 
-	return node, addr, replicaIdx, nil
+	return node, addr, replicaIdx, gpuSet, nil
 }
 
 // estimateModelVRAM estimates the VRAM required for a model using the unified estimator.

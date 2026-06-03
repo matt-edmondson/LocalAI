@@ -130,6 +130,15 @@ type fakeModelRouter struct {
 
 	// GetModelVRAMEstimate returns this value when non-nil; gorm.ErrRecordNotFound otherwise.
 	vramEstimate *ModelVRAMEstimate
+
+	// Per-GPU placement fakes (Task 3.4).
+	// candidateNodes is returned by CandidateNodesByFreeVRAM (already ordered).
+	candidateNodes []BackendNode
+	candidateErr   error
+	// nodeGPUs is returned by NodeGPUs for every node id (the mock-based tests
+	// model a single node, so one slice suffices).
+	nodeGPUs    []NodeGPU
+	nodeGPUsErr error
 }
 
 func (f *fakeModelRouter) FindAndLockNodeWithModel(_ context.Context, modelName string, _ []string, pref *RoutePreference) (*BackendNode, *NodeModel, error) {
@@ -171,7 +180,7 @@ func (f *fakeModelRouter) TouchNodeModel(_ context.Context, nodeID, modelName st
 	f.touchCalls = append(f.touchCalls, nodeID+":"+modelName)
 }
 
-func (f *fakeModelRouter) SetNodeModel(_ context.Context, nodeID, modelName string, _ int, state, address string, _ int) error {
+func (f *fakeModelRouter) SetNodeModel(_ context.Context, nodeID, modelName string, _ int, state, address string, _ int, _ string) error {
 	f.setCalls = append(f.setCalls, fmt.Sprintf("%s:%s:%s:%s", nodeID, modelName, state, address))
 	return nil
 }
@@ -276,6 +285,22 @@ func (f *fakeModelRouter) UpsertModelVRAMEstimate(_ context.Context, _, _ string
 	return nil
 }
 
+func (f *fakeModelRouter) CandidateNodesByFreeVRAM(_ context.Context, _ []string) ([]BackendNode, error) {
+	return f.candidateNodes, f.candidateErr
+}
+
+func (f *fakeModelRouter) NodeGPUs(_ context.Context, _ string) ([]NodeGPU, error) {
+	return f.nodeGPUs, f.nodeGPUsErr
+}
+
+func (f *fakeModelRouter) ReserveVRAMOnGPU(_ context.Context, _ string, _ int, _ uint64) error {
+	return nil
+}
+
+func (f *fakeModelRouter) ReleaseVRAMOnGPU(_ context.Context, _ string, _ int, _ uint64) error {
+	return nil
+}
+
 // fakeConflictResolver implements ConcurrencyConflictResolver from a static map.
 type fakeConflictResolver struct {
 	conflicts map[string][]string
@@ -347,6 +372,10 @@ type fakeUnloader struct {
 	stopErr     error
 	unloadCalls []string
 	unloadErr   error
+
+	// lastInstallGPUIndices captures the GPU indices the scheduler pinned on
+	// the most recent InstallBackend call (Task 3.4).
+	lastInstallGPUIndices []int
 }
 
 // installCall captures the args we care about when asserting that the
@@ -366,7 +395,7 @@ type upgradeCall struct {
 	replica int
 }
 
-func (f *fakeUnloader) InstallBackend(nodeID, backend, modelID, _, _, _, _ string, replica int, _ []int, _ string, _ func(messaging.BackendInstallProgressEvent)) (*messaging.BackendInstallReply, error) {
+func (f *fakeUnloader) InstallBackend(nodeID, backend, modelID, _, _, _, _ string, replica int, gpuIndices []int, _ string, _ func(messaging.BackendInstallProgressEvent)) (*messaging.BackendInstallReply, error) {
 	// installHook intentionally runs OUTSIDE the mutex: the hook may block
 	// on a channel and we don't want to serialize concurrent callers,
 	// which would defeat the singleflight-overlap test.
@@ -375,6 +404,7 @@ func (f *fakeUnloader) InstallBackend(nodeID, backend, modelID, _, _, _, _ strin
 	}
 	f.mu.Lock()
 	f.installCalls = append(f.installCalls, installCall{nodeID, backend, modelID, replica})
+	f.lastInstallGPUIndices = gpuIndices
 	f.mu.Unlock()
 	return f.installReply, f.installErr
 }
@@ -639,6 +669,37 @@ var _ = Describe("SmartRouter", func() {
 		})
 	})
 
+	Describe("per-GPU placement (mock-based)", func() {
+		const GiB = uint64(1) << 30
+
+		It("places a single-GPU model on the free GPU, not the full one", func() {
+			node := &BackendNode{ID: "n", Name: "noctis", Status: StatusHealthy, NodeType: NodeTypeBackend}
+			reg := &fakeModelRouter{
+				findAndLockErr: errors.New("not found"),
+				candidateNodes: []BackendNode{*node},
+				nodeGPUs: []NodeGPU{
+					{NodeID: "n", GPUIndex: 0, FreeVRAM: 200 << 20}, // GPU0 full
+					{NodeID: "n", GPUIndex: 1, FreeVRAM: 11 * GiB},  // GPU1 free
+				},
+				vramEstimate: &ModelVRAMEstimate{ModelName: "m", VRAMBytes: 7 * GiB, Source: "measured"},
+			}
+			unloader := &fakeUnloader{
+				installReply: &messaging.BackendInstallReply{Success: true, Address: "10.0.0.1:9001"},
+			}
+			router := NewSmartRouter(reg, SmartRouterOptions{
+				Unloader:      unloader,
+				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
+			})
+
+			gotNode, _, _, gpuSet, err := router.scheduleNewModel(context.Background(), "diffusers", "m", &pb.ModelOptions{Model: "m"})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(gotNode.ID).To(Equal("n"))
+			Expect(gpuSet).To(Equal([]int{1}))
+			// The pinned index must reach the worker via backend.install.
+			Expect(unloader.lastInstallGPUIndices).To(Equal([]int{1}))
+		})
+	})
+
 	Describe("UnloadModel (mock-based)", func() {
 		It("calls StopBackend and removes the model from the registry", func() {
 			reg := &fakeModelRouter{}
@@ -896,7 +957,7 @@ var _ = Describe("SmartRouter", func() {
 			Expect(registry.Register(context.Background(), node, true)).To(Succeed())
 
 			// Load a model and give it in-flight requests so it cannot be evicted
-			Expect(registry.SetNodeModel(context.Background(), node.ID, "busy-model", 0, "loaded", "", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node.ID, "busy-model", 0, "loaded", "", 0, "")).To(Succeed())
 			Expect(registry.IncrementInFlight(context.Background(), node.ID, "busy-model", 0)).To(Succeed())
 
 			router := NewSmartRouter(registry, SmartRouterOptions{DB: db})
@@ -917,7 +978,7 @@ var _ = Describe("SmartRouter", func() {
 				Address:  "10.0.0.101:50051",
 			}
 			Expect(registry.Register(context.Background(), node, true)).To(Succeed())
-			Expect(registry.SetNodeModel(context.Background(), node.ID, "cancel-model", 0, "loaded", "", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node.ID, "cancel-model", 0, "loaded", "", 0, "")).To(Succeed())
 			Expect(registry.IncrementInFlight(context.Background(), node.ID, "cancel-model", 0)).To(Succeed())
 
 			router := NewSmartRouter(registry, SmartRouterOptions{DB: db})
