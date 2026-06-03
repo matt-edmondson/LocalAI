@@ -855,6 +855,47 @@ var _ = Describe("SmartRouter", func() {
 			Expect(upsert.VRAMBytes).To(Equal(8*GiB2), "expected 12 GiB - 4 GiB = 8 GiB footprint")
 		})
 
+		// Task 4.3: a model larger than any single GPU must span both GPUs on the node
+		// (incident regression: 2×A2000 node, 18 GiB model, GPU0 full + GPU1 empty → OOM loop).
+		It("spans a model larger than any single GPU across both GPUs (incident regression: large-model split)", func() {
+			// Each GPU has 11.6 GiB free — enough only when combined (2×11.6 = 23.2 GiB ≥ 18 GiB).
+			// planGPUSet must select both GPUs (span path), sorted ascending: [0,1].
+			const freePerGPU = uint64(11900) << 20 // ~11.6 GiB; each < 18 GiB
+			node := &BackendNode{ID: "noctis", Name: "noctis-2gpu", Status: StatusHealthy, NodeType: NodeTypeBackend}
+			reg := &fakeModelRouter{
+				findAndLockErr: errors.New("not found"),
+				candidateNodes: []BackendNode{*node},
+				nodeGPUs: []NodeGPU{
+					{NodeID: "noctis", GPUIndex: 0, FreeVRAM: freePerGPU},
+					{NodeID: "noctis", GPUIndex: 1, FreeVRAM: freePerGPU},
+				},
+				vramEstimate: &ModelVRAMEstimate{ModelName: "big-diffuser", VRAMBytes: 18 << 30, Source: "measured"},
+			}
+			unloader := &fakeUnloader{
+				installReply: &messaging.BackendInstallReply{Success: true, Address: "10.0.0.1:9001"},
+			}
+			router := NewSmartRouter(reg, SmartRouterOptions{
+				Unloader:      unloader,
+				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
+			})
+
+			gotNode, _, _, gpuSet, err := router.scheduleNewModel(context.Background(), "diffusers", "big-diffuser", &pb.ModelOptions{Model: "big-diffuser"})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(gotNode.ID).To(Equal("noctis"))
+			// Both GPUs must be selected (sorted ascending: [0,1]).
+			Expect(gpuSet).To(Equal([]int{0, 1}))
+			// The pinned indices must reach the worker via backend.install.
+			Expect(unloader.lastInstallGPUIndices).To(Equal([]int{0, 1}))
+
+			// Separately verify applyGPUSet sets the multi-GPU knobs correctly for k=2.
+			// (applyGPUSet is called in the load path on a cloned ModelOptions, not inside
+			// scheduleNewModel itself; we unit-assert it here to pin the TensorSplit behaviour.)
+			splitOpts := &pb.ModelOptions{}
+			applyGPUSet(splitOpts, len(gpuSet))
+			Expect(splitOpts.TensorParallelSize).To(Equal(int32(2)))
+			Expect(splitOpts.TensorSplit).To(Equal("1,1"))
+		})
+
 		// Task 4.2: on load failure, bump the heuristic VRAM estimate ×1.5.
 		It("bumps the cached heuristic VRAM estimate ×1.5 after a load failure (Task 4.2)", func() {
 			// Node has one GPU with 12 GiB free — enough to fit the 6 GiB heuristic
