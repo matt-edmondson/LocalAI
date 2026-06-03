@@ -21,6 +21,13 @@ import (
 	"github.com/mudler/xlog"
 )
 
+// backendFreeTimeout bounds the best-effort gRPC Free() call made before
+// killing a backend process. A backend wedged mid-LoadModel can keep its
+// gRPC server busy indefinitely; without a bound, the kill — and the
+// backend.stop ack the frontend's abandoned-load cleanup blocks on — would
+// hang behind the very load being aborted.
+const backendFreeTimeout = 10 * time.Second
+
 // backendProcess represents a single gRPC backend process.
 type backendProcess struct {
 	proc    *process.Process
@@ -241,9 +248,11 @@ func (s *backendSupervisor) stopBackendExact(key string) {
 
 	client := grpc.NewClientWithToken(bp.addr, false, nil, false, s.cfg.RegistrationToken)
 	xlog.Debug("Calling Free() before stopping backend", "backend", key)
-	if err := client.Free(context.Background()); err != nil {
+	freeCtx, cancelFree := context.WithTimeout(context.Background(), backendFreeTimeout)
+	if err := client.Free(freeCtx); err != nil {
 		xlog.Warn("Free() failed (best-effort)", "backend", key, "error", err)
 	}
+	cancelFree()
 
 	xlog.Info("Stopping backend process", "backend", key, "addr", bp.addr)
 	if err := bp.proc.Stop(); err != nil {
