@@ -313,6 +313,9 @@ func (r *SmartRouter) cleanupAbandonedLoad(p *placement, trackingKey string) {
 	// the advisory lock, so a racing load of the same (node, model, replica)
 	// may have already succeeded and registered. Killing now would take down
 	// a live replica — skip the kill, keep the reservation rollback.
+	// LoadedReplicaStats only sees healthy nodes, so a row on a node that
+	// has since gone unhealthy does not block the kill — intentional: an
+	// unhealthy node is not serving traffic, and orphan cleanup wins.
 	kill := true
 	if stats, err := r.registry.LoadedReplicaStats(ctx, trackingKey, []string{p.node.ID}); err == nil {
 		for _, s := range stats {
