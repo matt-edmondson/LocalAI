@@ -21,7 +21,7 @@ import (
 func (s *backendSupervisor) subscribeLifecycleEvents() {
 	s.nats.SubscribeReply(messaging.SubjectNodeBackendInstall(s.nodeID), s.handleBackendInstall)
 	s.nats.SubscribeReply(messaging.SubjectNodeBackendUpgrade(s.nodeID), s.handleBackendUpgrade)
-	s.nats.Subscribe(messaging.SubjectNodeBackendStop(s.nodeID), s.handleBackendStop)
+	s.nats.SubscribeReply(messaging.SubjectNodeBackendStop(s.nodeID), s.handleBackendStop)
 	s.nats.SubscribeReply(messaging.SubjectNodeBackendDelete(s.nodeID), s.handleBackendDelete)
 	s.nats.SubscribeReply(messaging.SubjectNodeBackendList(s.nodeID), s.handleBackendList)
 	s.nats.SubscribeReply(messaging.SubjectNodeModelUnload(s.nodeID), s.handleModelUnload)
@@ -102,19 +102,23 @@ func (s *backendSupervisor) handleBackendUpgrade(data []byte, reply func([]byte)
 }
 
 // handleBackendStop is the NATS callback for backend.stop — stop a specific
-// backend process (fire-and-forget, no reply expected).
-func (s *backendSupervisor) handleBackendStop(data []byte) {
-	// Try to parse backend name from payload; if empty, stop all
-	var req struct {
-		Backend string `json:"backend"`
-	}
-	if json.Unmarshal(data, &req) == nil && req.Backend != "" {
-		xlog.Info("Received NATS backend.stop event", "backend", req.Backend)
-		s.stopBackend(req.Backend)
-	} else {
-		xlog.Info("Received NATS backend.stop event (all)")
-		s.stopAllBackends()
-	}
+// backend process. Fire-and-forget callers (eviction, admin unload) Publish
+// and never read the reply; the frontend's abandoned-load cleanup uses
+// request-reply and blocks on the ack so it can hold the model-load advisory
+// lock until the process is confirmed dead. The body runs in a goroutine so
+// a slow stop doesn't head-of-line-block other events on this subscription.
+func (s *backendSupervisor) handleBackendStop(data []byte, reply func([]byte)) {
+	go func() {
+		var req messaging.BackendStopRequest
+		if json.Unmarshal(data, &req) == nil && req.Backend != "" {
+			xlog.Info("Received NATS backend.stop event", "backend", req.Backend)
+			s.stopBackend(req.Backend)
+		} else {
+			xlog.Info("Received NATS backend.stop event (all)")
+			s.stopAllBackends()
+		}
+		replyJSON(reply, messaging.BackendStopReply{Success: true})
+	}()
 }
 
 // handleBackendDelete is the NATS callback for backend.delete — stop the
