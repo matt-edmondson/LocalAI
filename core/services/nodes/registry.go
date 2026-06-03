@@ -1119,12 +1119,14 @@ func (r *NodeRegistry) LoadedReplicaStats(ctx context.Context, modelName string,
 		q = q.Where("node_models.node_id IN ?", candidateNodeIDs)
 	}
 
-	// Narrow to only the columns the sole consumer (router buildPreference)
-	// reads: NodeID and InFlight. The other ReplicaCandidate fields stay at
-	// their zero value, which the consumer does not read. This avoids the
-	// JOIN-side available_vram fetch and the extra column transfer.
+	// Narrow to the columns the consumers read: NodeID, ReplicaIndex, and
+	// InFlight. buildPreference keys prefixcache.ReplicaKey on ReplicaIndex
+	// and the abandoned-load cleanup guard matches on it, so it must be real
+	// — selecting only node_id+in_flight silently pinned every replica key
+	// to 0. The remaining ReplicaCandidate fields stay at their zero value;
+	// this still avoids the JOIN-side available_vram fetch.
 	var rows []row
-	err := q.Select("node_models.node_id AS node_id, node_models.in_flight AS in_flight").
+	err := q.Select("node_models.node_id AS node_id, node_models.replica_index AS replica_index, node_models.in_flight AS in_flight").
 		Scan(&rows).Error
 	if err != nil {
 		return nil, fmt.Errorf("loading replica stats for %s: %w", modelName, err)
