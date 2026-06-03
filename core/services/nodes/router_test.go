@@ -60,6 +60,9 @@ func (f *fakeFileStager) ListRemoteDir(_ context.Context, _, _ string) ([]string
 
 // fakeModelRouter implements ModelRouter with configurable return values.
 type fakeModelRouter struct {
+	// mu guards all mutable fields so measurement goroutines don't race test assertions.
+	mu sync.Mutex
+
 	// FindAndLockNodeWithModel returns
 	findAndLockNode *BackendNode
 	findAndLockNM   *NodeModel
@@ -139,6 +142,15 @@ type fakeModelRouter struct {
 	// model a single node, so one slice suffices).
 	nodeGPUs    []NodeGPU
 	nodeGPUsErr error
+
+	// nodeGPUsSeq is an optional sequence of snapshots for NodeGPUs. When non-empty,
+	// each call to NodeGPUs pops and returns the first entry; the last entry repeats.
+	// Falls back to nodeGPUs when empty.
+	nodeGPUsSeq [][]NodeGPU
+
+	// lastUpsert captures the most recent UpsertModelVRAMEstimate call with
+	// source=="measured". Protected by mu.
+	lastUpsert *ModelVRAMEstimate
 }
 
 func (f *fakeModelRouter) FindAndLockNodeWithModel(_ context.Context, modelName string, _ []string, pref *RoutePreference) (*BackendNode, *NodeModel, error) {
@@ -281,7 +293,18 @@ func (f *fakeModelRouter) GetModelVRAMEstimate(_ context.Context, _ string) (*Mo
 	return f.vramEstimate, nil
 }
 
-func (f *fakeModelRouter) UpsertModelVRAMEstimate(_ context.Context, _, _ string, _ uint64, _ string, _ int) error {
+func (f *fakeModelRouter) UpsertModelVRAMEstimate(_ context.Context, modelName, backend string, bytes uint64, source string, gpuCount int) error {
+	if source == "measured" {
+		f.mu.Lock()
+		f.lastUpsert = &ModelVRAMEstimate{
+			ModelName:        modelName,
+			Backend:          backend,
+			VRAMBytes:        bytes,
+			Source:           source,
+			GPUCountObserved: gpuCount,
+		}
+		f.mu.Unlock()
+	}
 	return nil
 }
 
@@ -290,6 +313,15 @@ func (f *fakeModelRouter) CandidateNodesByFreeVRAM(_ context.Context, _ []string
 }
 
 func (f *fakeModelRouter) NodeGPUs(_ context.Context, _ string) ([]NodeGPU, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.nodeGPUsSeq) > 0 {
+		snap := f.nodeGPUsSeq[0]
+		if len(f.nodeGPUsSeq) > 1 {
+			f.nodeGPUsSeq = f.nodeGPUsSeq[1:]
+		}
+		return snap, f.nodeGPUsErr
+	}
 	return f.nodeGPUs, f.nodeGPUsErr
 }
 
@@ -752,6 +784,67 @@ var _ = Describe("SmartRouter", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(gotNode.ID).To(Equal("legacy"))
 			Expect(gpuSet).To(BeEmpty(), "legacy fallback must not pin a GPU (no estimate available)")
+		})
+
+		// Task 4.1: after a successful load, the VRAM footprint is measured and cached.
+		It("caches a measured VRAM estimate after a successful load (Task 4.1)", func() {
+			// Node has two GPUs: GPU0 is nearly full, GPU1 has 12 GiB free pre-load.
+			// The vramEstimate (6 GiB) is used for placement so the scheduler picks GPU1.
+			//
+			// NodeGPUs sequence:
+			//   call 1 (scheduleNewModel placement loop): pre snapshot — GPU1 free=12 GiB
+			//   call 2 (scheduleAndLoad pre-load capture): pre snapshot — GPU1 free=12 GiB
+			//   call 3+ (recordMeasuredVRAM post-load poll): post snapshot — GPU1 free=4 GiB
+			//
+			// Expected measured footprint: 12 GiB - 4 GiB = 8 GiB.
+			const GiB2 = uint64(1) << 30
+			preSnap := []NodeGPU{
+				{NodeID: "n", GPUIndex: 0, FreeVRAM: 200 << 20},
+				{NodeID: "n", GPUIndex: 1, FreeVRAM: 12 * GiB2},
+			}
+			postSnap := []NodeGPU{
+				{NodeID: "n", GPUIndex: 0, FreeVRAM: 200 << 20},
+				{NodeID: "n", GPUIndex: 1, FreeVRAM: 4 * GiB2},
+			}
+
+			node := &BackendNode{ID: "n", Name: "noctis", Status: StatusHealthy, NodeType: NodeTypeBackend}
+			f := &fakeModelRouter{
+				findAndLockErr: errors.New("not found"),
+				candidateNodes: []BackendNode{*node},
+				// Two pre-snapshots (placement + pre-capture), then post repeats.
+				nodeGPUsSeq: [][]NodeGPU{preSnap, preSnap, postSnap},
+				// 6 GiB measured estimate drives placement onto GPU1 (12 GiB free).
+				vramEstimate: &ModelVRAMEstimate{ModelName: "m", VRAMBytes: 6 * GiB2, Source: "measured"},
+			}
+			unloader := &fakeUnloader{
+				installReply: &messaging.BackendInstallReply{Success: true, Address: "10.0.0.1:9001"},
+			}
+			router := NewSmartRouter(f, SmartRouterOptions{
+				Unloader:      unloader,
+				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
+			})
+			// Speed up the measurement loop so the test finishes quickly.
+			router.measureSettleAttempts = 3
+			router.measureSettleDelay = time.Millisecond
+
+			result, err := router.scheduleAndLoad(context.Background(), "diffusers", "m", "m",
+				&pb.ModelOptions{Model: "m"}, false, 1)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.Node.ID).To(Equal("n"))
+			Expect(result.GPUSet).To(Equal([]int{1}))
+
+			// The measurement goroutine fires in the background; wait for it to write.
+			Eventually(func() *ModelVRAMEstimate {
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				return f.lastUpsert
+			}, "2s", "10ms").ShouldNot(BeNil())
+
+			f.mu.Lock()
+			upsert := f.lastUpsert
+			f.mu.Unlock()
+			Expect(upsert.Source).To(Equal("measured"))
+			Expect(upsert.VRAMBytes).To(Equal(8*GiB2), "expected 12 GiB - 4 GiB = 8 GiB footprint")
 		})
 	})
 

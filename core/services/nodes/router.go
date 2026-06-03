@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mudler/LocalAI/core/services/advisorylock"
@@ -108,6 +110,15 @@ type SmartRouter struct {
 	// per-request routing doesn't stall behind a busy backend's serialized
 	// HealthCheck/Predict. See probe_cache.go for the rationale.
 	probeCache *probeCache
+	// measureLoads counts in-flight scheduleAndLoad operations per node so the
+	// post-load VRAM measurement can skip windows where another concurrent load
+	// on the same node would confound the per-GPU delta.
+	measureLoads sync.Map // nodeID -> *atomic.Int32
+	// measureSettleAttempts and measureSettleDelay control how long
+	// recordMeasuredVRAM waits for heartbeat-fed free_vram to settle after a
+	// load before sampling the post-load snapshot.
+	measureSettleAttempts int
+	measureSettleDelay    time.Duration
 }
 
 // probeCacheTTL is how long a successful gRPC HealthCheck on a backend is
@@ -146,6 +157,8 @@ func NewSmartRouter(registry ModelRouter, opts SmartRouterOptions) *SmartRouter 
 	if r.vramEstimator == nil {
 		r.vramEstimator = r.estimateModelVRAM
 	}
+	r.measureSettleAttempts = 3
+	r.measureSettleDelay = 6 * time.Second
 	return r
 }
 
@@ -167,6 +180,70 @@ type scheduleLoadResult struct {
 	GPUSet []int
 }
 
+// incLoads increments the in-flight load counter for the given node and returns
+// a decrement closure. Use with defer to ensure the counter is always decremented.
+func (r *SmartRouter) incLoads(nodeID string) func() {
+	v, _ := r.measureLoads.LoadOrStore(nodeID, &atomic.Int32{})
+	ctr := v.(*atomic.Int32)
+	ctr.Add(1)
+	return func() { ctr.Add(-1) }
+}
+
+// loadsInFlight returns the current number of in-flight scheduleAndLoad
+// operations for the given node.
+func (r *SmartRouter) loadsInFlight(nodeID string) int32 {
+	v, ok := r.measureLoads.Load(nodeID)
+	if !ok {
+		return 0
+	}
+	return v.(*atomic.Int32).Load()
+}
+
+// recordMeasuredVRAM polls per-GPU free after a successful load and caches the
+// observed footprint (sum of free-VRAM drop across the assigned GPUs) as a
+// "measured" estimate. Best-effort: skips (keeping the heuristic) when the
+// delta can't be cleanly attributed — another load in flight on the node, a
+// GPU's free went UP, or the heartbeat never settled.
+func (r *SmartRouter) recordMeasuredVRAM(ctx context.Context, nodeID, modelName, backend string, gpuSet []int, preFree map[int]uint64) {
+	for attempt := 0; attempt < r.measureSettleAttempts; attempt++ {
+		select {
+		case <-time.After(r.measureSettleDelay):
+		case <-ctx.Done():
+			return
+		}
+		if r.loadsInFlight(nodeID) > 0 {
+			xlog.Debug("Skipping VRAM measurement: concurrent load on node", "node", nodeID, "model", modelName)
+			return
+		}
+		gpus, err := r.registry.NodeGPUs(ctx, nodeID)
+		if err != nil {
+			continue
+		}
+		byIdx := make(map[int]uint64, len(gpus))
+		for _, g := range gpus {
+			byIdx[g.GPUIndex] = g.FreeVRAM
+		}
+		var footprint uint64
+		ok := true
+		for _, gi := range gpuSet {
+			pre, havePre := preFree[gi]
+			post, havePost := byIdx[gi]
+			if !havePre || !havePost || post >= pre {
+				ok = false
+				break
+			}
+			footprint += pre - post
+		}
+		if ok && footprint > 0 {
+			if err := r.registry.UpsertModelVRAMEstimate(ctx, modelName, backend, footprint, "measured", len(gpuSet)); err != nil {
+				xlog.Debug("failed to cache measured VRAM", "model", modelName, "error", err)
+			}
+			return
+		}
+	}
+	xlog.Debug("measured VRAM not cleanly attributable; keeping heuristic", "model", modelName, "node", nodeID)
+}
+
 // scheduleAndLoad is the shared core for loading a model on a new node.
 // Used by both Route() (for first-time loads) and ScheduleAndLoadModel() (for reconciler scale-ups).
 //
@@ -180,6 +257,29 @@ func (r *SmartRouter) scheduleAndLoad(ctx context.Context, backendType, tracking
 	node, backendAddr, replicaIndex, gpuSet, err := r.scheduleNewModel(ctx, backendType, trackingKey, modelOpts)
 	if err != nil {
 		return nil, fmt.Errorf("no available nodes: %w", err)
+	}
+
+	// Task 4.1: capture pre-load free VRAM snapshot and track this in-flight load
+	// for clean attribution of the post-load delta.
+	var preFree map[int]uint64
+	var decLoads func()
+	if len(gpuSet) > 0 {
+		decLoads = r.incLoads(node.ID)
+		if gpus, gerr := r.registry.NodeGPUs(ctx, node.ID); gerr == nil {
+			preFree = make(map[int]uint64, len(gpuSet))
+			byIdx := make(map[int]uint64, len(gpus))
+			for _, g := range gpus {
+				byIdx[g.GPUIndex] = g.FreeVRAM
+			}
+			for _, gi := range gpuSet {
+				if v, ok := byIdx[gi]; ok {
+					preFree[gi] = v
+				}
+			}
+		}
+	}
+	if decLoads != nil {
+		defer decLoads()
 	}
 
 	// Pre-stage model files via FileStager before loading
@@ -241,6 +341,12 @@ func (r *SmartRouter) scheduleAndLoad(ctx context.Context, backendType, tracking
 				xlog.Warn("Failed to upsert per-model load info", "model", trackingKey, "error", storeErr)
 			}
 		}
+	}
+
+	// Task 4.1: fire post-load VRAM measurement in the background.
+	// context.Background() is intentional — measurement must outlive the request ctx.
+	if len(gpuSet) > 0 && len(preFree) == len(gpuSet) {
+		go r.recordMeasuredVRAM(context.Background(), node.ID, trackingKey, backendType, gpuSet, preFree)
 	}
 
 	return &scheduleLoadResult{Node: node, Client: client, BackendAddr: backendAddr, ReplicaIndex: replicaIndex, GPUSet: gpuSet}, nil
