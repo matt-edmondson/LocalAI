@@ -698,6 +698,61 @@ var _ = Describe("SmartRouter", func() {
 			// The pinned index must reach the worker via backend.install.
 			Expect(unloader.lastInstallGPUIndices).To(Equal([]int{1}))
 		})
+
+		// Task 3.5: terminal error when a real estimate exceeds every GPU set.
+		It("returns a clear terminal error when no GPU set on any node fits the estimate", func() {
+			// One node with 2 GiB free, model needs 40 GiB.
+			// sawPerGPUNode=true (node has GPU data), planGPUSet fails → eviction.
+			// DB=nil → evictLRUAndFreeNode returns ErrEvictionBusy every attempt.
+			// After the eviction loop, node==nil AND estimatedVRAM>0 → terminal error.
+			node := &BackendNode{ID: "n", Name: "small", Status: StatusHealthy, NodeType: NodeTypeBackend}
+			reg := &fakeModelRouter{
+				findAndLockErr: errors.New("not found"),
+				candidateNodes: []BackendNode{*node},
+				nodeGPUs:       []NodeGPU{{NodeID: "n", GPUIndex: 0, FreeVRAM: 2 * GiB}},
+				vramEstimate:   &ModelVRAMEstimate{ModelName: "big", VRAMBytes: 40 * GiB, Source: "measured"},
+			}
+			unloader := &fakeUnloader{
+				installReply: &messaging.BackendInstallReply{Success: true, Address: "10.0.0.1:9001"},
+			}
+			router := NewSmartRouter(reg, SmartRouterOptions{
+				Unloader:      unloader,
+				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
+				// DB intentionally nil: evictLRUAndFreeNode returns ErrEvictionBusy.
+			})
+
+			_, _, _, _, err := router.scheduleNewModel(context.Background(), "diffusers", "big", &pb.ModelOptions{Model: "big"})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("more VRAM than any GPU set"))
+		})
+
+		// Task 3.5: estimate==0 must never hard-fail — falls back to legacy placement.
+		It("falls back to legacy idle-node placement when estimate is zero and per-GPU data fits nothing", func() {
+			// Node has one GPU with zero effective-free VRAM → largestFreeGPU fails.
+			// vramEstimate=nil + no ModelFile → estimatedVRAM=0.
+			// After the per-GPU and mixed-version blocks both skip, node==nil AND
+			// estimatedVRAM==0 → legacy fallback to FindIdleNode succeeds.
+			legacyNode := &BackendNode{ID: "legacy", Name: "legacy-node", Status: StatusHealthy, NodeType: NodeTypeBackend}
+			reg := &fakeModelRouter{
+				findAndLockErr: errors.New("not found"),
+				candidateNodes: []BackendNode{{ID: "n", Name: "n", Status: StatusHealthy, NodeType: NodeTypeBackend}},
+				nodeGPUs:       []NodeGPU{{NodeID: "n", GPUIndex: 0, FreeVRAM: 0}},
+				// vramEstimate nil → GetModelVRAMEstimate returns gorm.ErrRecordNotFound → estimatedVRAM=0
+				findIdleNode: legacyNode,
+			}
+			unloader := &fakeUnloader{
+				installReply: &messaging.BackendInstallReply{Success: true, Address: "10.0.0.1:9001"},
+			}
+			router := NewSmartRouter(reg, SmartRouterOptions{
+				Unloader:      unloader,
+				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
+			})
+
+			gotNode, _, _, gpuSet, err := router.scheduleNewModel(context.Background(), "diffusers", "unknown-size", &pb.ModelOptions{Model: "unknown-size"})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(gotNode.ID).To(Equal("legacy"))
+			Expect(gpuSet).To(BeEmpty(), "legacy fallback must not pin a GPU (no estimate available)")
+		})
 	})
 
 	Describe("UnloadModel (mock-based)", func() {

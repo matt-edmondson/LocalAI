@@ -947,8 +947,36 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 		}
 
 		if node == nil {
-			return nil, "", 0, nil, fmt.Errorf("eviction could not free a node with %s VRAM for model %s",
-				vram.FormatBytes(estimatedVRAM), modelID)
+			if estimatedVRAM > 0 {
+				// A real estimate that fits nowhere is a definitive terminal failure.
+				// Return immediately so the caller never starts a retry loop that
+				// would OOM the worker: the model needs more VRAM than the cluster
+				// can provide on any GPU set.
+				return nil, "", 0, nil, fmt.Errorf(
+					"model %s needs ~%s, more VRAM than any GPU set on any node can provide",
+					modelID, vram.FormatBytes(estimatedVRAM))
+			}
+			// Unknown estimate (estimatedVRAM == 0): the model's VRAM footprint
+			// could not be determined. Preserving liveness is the rule
+			// ("estimate == 0 must never hard-fail a load"). Fall back to the
+			// legacy VRAM-blind placement so the load still proceeds on any
+			// available node, without a CUDA pin. This covers all-old-workers
+			// clusters and any model whose file isn't stat-able on the frontend.
+			if candidateNodeIDs != nil {
+				node, _ = r.registry.FindIdleNodeFromSet(ctx, candidateNodeIDs)
+				if node == nil {
+					node, _ = r.registry.FindLeastLoadedNodeFromSet(ctx, candidateNodeIDs)
+				}
+			} else {
+				node, _ = r.registry.FindIdleNode(ctx)
+				if node == nil {
+					node, _ = r.registry.FindLeastLoadedNode(ctx)
+				}
+			}
+			if node == nil {
+				return nil, "", 0, nil, fmt.Errorf("no healthy node available for model %s", modelID)
+			}
+			// gpuSet stays empty: no CUDA_VISIBLE_DEVICES pin (pre-feature behavior).
 		}
 	}
 
