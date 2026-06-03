@@ -564,6 +564,41 @@ func (r *NodeRegistry) ReleaseVRAM(ctx context.Context, nodeID string, bytes uin
 		UpdateColumn(ColReservedVRAM, gorm.Expr("reserved_vram - ?", bytes)).Error
 }
 
+// ReserveVRAMOnGPU atomically deducts a soft reservation from one GPU's
+// effectively-free VRAM (free - reserved). Mirrors ReserveVRAM but per-GPU.
+func (r *NodeRegistry) ReserveVRAMOnGPU(ctx context.Context, nodeID string, gpuIndex int, bytes uint64) error {
+	if bytes == 0 {
+		return nil
+	}
+	res := r.db.WithContext(ctx).Model(&NodeGPU{}).
+		Where("node_id = ? AND gpu_index = ? AND (free_vram - reserved_vram) >= ?", nodeID, gpuIndex, bytes).
+		UpdateColumn("reserved_vram", gorm.Expr("reserved_vram + ?", bytes))
+	if res.Error != nil {
+		return fmt.Errorf("reserving %d bytes on node %s gpu %d: %w", bytes, nodeID, gpuIndex, res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrInsufficientVRAM
+	}
+	return nil
+}
+
+// ReleaseVRAMOnGPU returns a per-GPU soft reservation (rollback on failed load).
+func (r *NodeRegistry) ReleaseVRAMOnGPU(ctx context.Context, nodeID string, gpuIndex int, bytes uint64) error {
+	if bytes == 0 {
+		return nil
+	}
+	return r.db.WithContext(ctx).Model(&NodeGPU{}).
+		Where("node_id = ? AND gpu_index = ? AND reserved_vram >= ?", nodeID, gpuIndex, bytes).
+		UpdateColumn("reserved_vram", gorm.Expr("reserved_vram - ?", bytes)).Error
+}
+
+// NodeGPUs returns the node's GPUs ordered by index.
+func (r *NodeRegistry) NodeGPUs(ctx context.Context, nodeID string) ([]NodeGPU, error) {
+	var gpus []NodeGPU
+	err := r.db.WithContext(ctx).Where("node_id = ?", nodeID).Order("gpu_index ASC").Find(&gpus).Error
+	return gpus, err
+}
+
 // Deregister removes a backend node, its model associations, and any auto-provisioned auth credentials.
 func (r *NodeRegistry) Deregister(ctx context.Context, nodeID string) error {
 	db := r.db.WithContext(ctx)

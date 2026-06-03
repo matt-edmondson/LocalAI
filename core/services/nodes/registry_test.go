@@ -1501,4 +1501,28 @@ var _ = Describe("NodeRegistry", func() {
 			Expect(got.ReservedVRAM).To(Equal(uint64(0)))
 		})
 	})
+
+	Describe("per-GPU reservation", func() {
+		BeforeEach(func() {
+			Expect(db.Create(&NodeGPU{NodeID: "n", GPUIndex: 0, TotalVRAM: uint64(12e9), FreeVRAM: uint64(12e9)}).Error).To(Succeed())
+		})
+		It("ReserveVRAMOnGPU deducts from effectively-free and rejects when insufficient", func() {
+			Expect(registry.ReserveVRAMOnGPU(context.Background(), "n", 0, uint64(8e9))).To(Succeed())
+			err := registry.ReserveVRAMOnGPU(context.Background(), "n", 0, uint64(8e9))
+			Expect(err).To(MatchError(ErrInsufficientVRAM))
+		})
+		It("ReleaseVRAMOnGPU gives the reservation back", func() {
+			Expect(registry.ReserveVRAMOnGPU(context.Background(), "n", 0, uint64(8e9))).To(Succeed())
+			Expect(registry.ReleaseVRAMOnGPU(context.Background(), "n", 0, uint64(8e9))).To(Succeed())
+			Expect(registry.ReserveVRAMOnGPU(context.Background(), "n", 0, uint64(8e9))).To(Succeed())
+		})
+		It("NodeGPUs returns the node's GPUs ordered by index", func() {
+			Expect(db.Create(&NodeGPU{NodeID: "n", GPUIndex: 1, TotalVRAM: uint64(12e9), FreeVRAM: uint64(4e9)}).Error).To(Succeed())
+			gpus, err := registry.NodeGPUs(context.Background(), "n")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(gpus).To(HaveLen(2))
+			Expect(gpus[0].GPUIndex).To(Equal(0))
+			Expect(gpus[1].GPUIndex).To(Equal(1))
+		})
+	})
 })
