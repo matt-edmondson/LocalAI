@@ -262,7 +262,8 @@ func (a *RemoteUnloaderAdapter) StopBackend(nodeID, backend string) error {
 }
 
 // backendStopAckTimeout bounds the synchronous backend.stop request-reply:
-// the worker's bounded Free() (10s) + proc.Stop + NATS delivery.
+// the worker's bounded Free() (10s) + proc.Stop's SIGTERM grace before SIGKILL
+// (up to 15s, go-processmanager default) + NATS delivery.
 const backendStopAckTimeout = 30 * time.Second
 
 // StopBackendAndWait tells a worker to stop a backend process and waits for
