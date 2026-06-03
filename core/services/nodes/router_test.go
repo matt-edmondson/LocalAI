@@ -155,6 +155,10 @@ type fakeModelRouter struct {
 	// lastHeuristicUpsert captures the most recent UpsertModelVRAMEstimate call
 	// with source=="heuristic". Protected by mu.
 	lastHeuristicUpsert *ModelVRAMEstimate
+
+	// lastEstimateKey captures the model name argument passed to the most
+	// recent GetModelVRAMEstimate call. Protected by mu.
+	lastEstimateKey string
 }
 
 func (f *fakeModelRouter) FindAndLockNodeWithModel(_ context.Context, modelName string, _ []string, pref *RoutePreference) (*BackendNode, *NodeModel, error) {
@@ -290,7 +294,10 @@ func (f *fakeModelRouter) FindNodesWithModel(_ context.Context, modelName string
 	return f.findNodesWithModelByName[modelName], nil
 }
 
-func (f *fakeModelRouter) GetModelVRAMEstimate(_ context.Context, _ string) (*ModelVRAMEstimate, error) {
+func (f *fakeModelRouter) GetModelVRAMEstimate(_ context.Context, modelName string) (*ModelVRAMEstimate, error) {
+	f.mu.Lock()
+	f.lastEstimateKey = modelName
+	f.mu.Unlock()
 	if f.vramEstimate == nil {
 		return nil, gorm.ErrRecordNotFound
 	}
@@ -694,7 +701,7 @@ var _ = Describe("SmartRouter", func() {
 			router := NewSmartRouter(reg, SmartRouterOptions{
 				Unloader:      unloader,
 				ClientFactory: factory,
-				VRAMEstimator: func(_ context.Context, _ *pb.ModelOptions) uint64 {
+				VRAMEstimator: func(_ context.Context, _ string, _ *pb.ModelOptions) uint64 {
 					return 25 * 1024 * 1024 * 1024 // 25 GiB — more than any test node has
 				},
 				// DB nil → eviction returns ErrEvictionBusy, so Route fails.
@@ -1160,8 +1167,34 @@ var _ = Describe("SmartRouter", func() {
 			}
 			router := NewSmartRouter(reg, SmartRouterOptions{})
 
-			got := router.estimateModelVRAM(context.Background(), &pb.ModelOptions{Model: "m"})
+			got := router.estimateModelVRAM(context.Background(), "m", &pb.ModelOptions{Model: "m"})
 			Expect(got).To(Equal(uint64(7_000_000_000)))
+		})
+
+		It("looks up the cache by model ID, not model file name (regression: name != file)", func() {
+			// Bug: cache was keyed by opts.Model (the file name, e.g. "Model-File.gguf")
+			// but measured writes used the tracking key ("model-id"). This caused the
+			// measured-wins path to silently never fire when config name != config Model.
+			reg := &fakeModelRouter{
+				vramEstimate: &ModelVRAMEstimate{
+					ModelName: "model-id",
+					VRAMBytes: 7 << 30,
+					Source:    "measured",
+				},
+			}
+			router := NewSmartRouter(reg, SmartRouterOptions{})
+
+			got := router.estimateModelVRAM(context.Background(), "model-id", &pb.ModelOptions{Model: "Model-File.gguf"})
+			Expect(got).To(Equal(uint64(7<<30)), "must return the measured estimate keyed by model ID")
+
+			// Assert the key that reached GetModelVRAMEstimate was the model ID,
+			// not the file name. Without this pin, the test passes even against
+			// the buggy code (fake ignores the name and returns vramEstimate).
+			reg.mu.Lock()
+			capturedKey := reg.lastEstimateKey
+			reg.mu.Unlock()
+			Expect(capturedKey).To(Equal("model-id"),
+				"cache lookup must use the tracking key (model ID), not the model file name")
 		})
 	})
 

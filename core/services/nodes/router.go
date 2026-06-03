@@ -57,7 +57,7 @@ type SmartRouterOptions struct {
 	// this nil and SmartRouter uses estimateModelVRAM. Tests inject a stub so
 	// they can exercise the VRAM-aware scheduling branches without real GGUF
 	// files on disk.
-	VRAMEstimator func(context.Context, *pb.ModelOptions) uint64
+	VRAMEstimator func(context.Context, string, *pb.ModelOptions) uint64
 	// PrefixProvider, when set, enables prefix-cache-aware routing: requests
 	// carrying a prompt prefix chain (distributedhdr.PrefixChain) are biased
 	// toward the node that already holds the longest matching prefix, subject
@@ -92,7 +92,7 @@ type SmartRouter struct {
 	// vramEstimator is the function that returns the estimated VRAM bytes
 	// required to load a model. Defaults to estimateModelVRAM; overridable
 	// via SmartRouterOptions.VRAMEstimator for tests.
-	vramEstimator func(context.Context, *pb.ModelOptions) uint64
+	vramEstimator func(context.Context, string, *pb.ModelOptions) uint64
 	// prefixProvider is the prefix-cache routing seam (nil disables it; see
 	// SmartRouterOptions.PrefixProvider). prefixConfig holds the global policy
 	// and thresholds.
@@ -866,7 +866,7 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 	// Estimate VRAM required for the model
 	var estimatedVRAM uint64
 	if modelOpts != nil {
-		estimatedVRAM = r.vramEstimator(ctx, modelOpts)
+		estimatedVRAM = r.vramEstimator(ctx, modelID, modelOpts)
 	}
 
 	// Check for scheduling constraints (node selector). If a selector is set,
@@ -1185,13 +1185,23 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 
 // estimateModelVRAM estimates the VRAM required for a model using the unified estimator.
 // Precedence: (1) measured/cached estimate, (2) GGUF/HF metadata, (3) file-size heuristic.
-func (r *SmartRouter) estimateModelVRAM(ctx context.Context, opts *pb.ModelOptions) uint64 {
+// modelID is the logical model identifier (trackingKey) used for cache reads/writes; opts
+// carries the file path and HF repo for metadata/heuristic estimation.
+func (r *SmartRouter) estimateModelVRAM(ctx context.Context, modelID string, opts *pb.ModelOptions) uint64 {
 	estCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
+	// cacheKey is the stable identifier used for all cache reads/writes.
+	// modelID is preferred (the logical tracking key, e.g. "qwen3-35b"); fall
+	// back to opts.Model only when modelID is empty (defensive).
+	cacheKey := modelID
+	if cacheKey == "" {
+		cacheKey = opts.Model
+	}
+
 	// 1. Measured/cached estimate wins (set after a real load).
-	if opts.Model != "" {
-		if cached, err := r.registry.GetModelVRAMEstimate(ctx, opts.Model); err == nil && cached.VRAMBytes > 0 {
+	if cacheKey != "" {
+		if cached, err := r.registry.GetModelVRAMEstimate(estCtx, cacheKey); err == nil && cached.VRAMBytes > 0 {
 			return cached.VRAMBytes
 		}
 	}
@@ -1234,9 +1244,9 @@ func (r *SmartRouter) estimateModelVRAM(ctx context.Context, opts *pb.ModelOptio
 	//    cache so subsequent placements are consistent until a measured value
 	//    replaces it.
 	heur := vram.EstimateHeuristic(opts.ModelFile)
-	if heur > 0 && opts.Model != "" {
-		if err := r.registry.UpsertModelVRAMEstimate(ctx, opts.Model, "", heur, "heuristic", 1); err != nil {
-			xlog.Debug("failed to seed heuristic VRAM estimate", "model", opts.Model, "error", err)
+	if heur > 0 && cacheKey != "" {
+		if err := r.registry.UpsertModelVRAMEstimate(estCtx, cacheKey, "", heur, "heuristic", 1); err != nil {
+			xlog.Debug("failed to seed heuristic VRAM estimate", "model", cacheKey, "error", err)
 		}
 	}
 	return heur
