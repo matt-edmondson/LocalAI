@@ -59,9 +59,22 @@ type backendSupervisor struct {
 	backendLocks map[string]*sync.Mutex
 }
 
+// cudaVisibleDevicesEnv builds the CUDA_VISIBLE_DEVICES assignment for a backend
+// process, or "" when no GPUs were assigned (CPU / legacy single-GPU).
+func cudaVisibleDevicesEnv(gpuIndices []int) string {
+	if len(gpuIndices) == 0 {
+		return ""
+	}
+	parts := make([]string, len(gpuIndices))
+	for i, idx := range gpuIndices {
+		parts[i] = strconv.Itoa(idx)
+	}
+	return "CUDA_VISIBLE_DEVICES=" + strings.Join(parts, ",")
+}
+
 // startBackend starts a gRPC backend process on a dynamically allocated port.
 // Returns the gRPC address.
-func (s *backendSupervisor) startBackend(backend, backendPath string) (string, error) {
+func (s *backendSupervisor) startBackend(backend, backendPath string, gpuIndices []int) (string, error) {
 	s.mu.Lock()
 
 	// Already running?
@@ -87,7 +100,11 @@ func (s *backendSupervisor) startBackend(backend, backendPath string) (string, e
 	bindAddr := fmt.Sprintf("0.0.0.0:%d", port)
 	clientAddr := fmt.Sprintf("127.0.0.1:%d", port)
 
-	proc, err := s.ml.StartProcess(backendPath, backend, bindAddr)
+	var extraEnv []string
+	if env := cudaVisibleDevicesEnv(gpuIndices); env != "" {
+		extraEnv = []string{env}
+	}
+	proc, err := s.ml.StartProcessWithEnv(backendPath, backend, bindAddr, extraEnv)
 	if err != nil {
 		s.mu.Unlock()
 		return "", fmt.Errorf("starting backend process: %w", err)
