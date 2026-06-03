@@ -88,12 +88,43 @@ type NodeModel struct {
 	State         string    `gorm:"size:32;default:idle" json:"state"` // loading, loaded, unloading, idle
 	InFlight      int       `json:"in_flight"`                         // number of active requests on this replica
 	LastUsed      time.Time `json:"last_used"`
-	LoadingBy     string    `gorm:"size:36" json:"loading_by,omitempty"`    // frontend ID that triggered loading
-	BackendType   string    `gorm:"size:128" json:"backend_type,omitempty"` // e.g. "llama-cpp"; used by reconciler to replicate loads
-	ModelOptsBlob []byte    `gorm:"type:bytea" json:"-"`                    // serialized pb.ModelOptions for replica scale-ups
+	LoadingBy     string    `gorm:"size:36" json:"loading_by,omitempty"`                     // frontend ID that triggered loading
+	BackendType   string    `gorm:"size:128" json:"backend_type,omitempty"`                  // e.g. "llama-cpp"; used by reconciler to replicate loads
+	ModelOptsBlob []byte    `gorm:"type:bytea" json:"-"`                                     // serialized pb.ModelOptions for replica scale-ups
+	GPUIndices    string    `gorm:"column:gpu_indices;size:64" json:"gpu_indices,omitempty"` // CSV of assigned physical GPU indices
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
+
+// NodeGPU is one physical GPU on a backend node. Free/total VRAM are refreshed
+// by the worker heartbeat (the worker is the source of truth). ReservedVRAM is
+// the per-GPU soft, in-tick reservation the scheduler deducts when it assigns a
+// model to this GPU; the worker's next heartbeat clears it back to 0.
+type NodeGPU struct {
+	NodeID       string    `gorm:"primaryKey;size:36" json:"node_id"`
+	GPUIndex     int       `gorm:"primaryKey;column:gpu_index" json:"gpu_index"`
+	TotalVRAM    uint64    `gorm:"column:total_vram" json:"total_vram"`
+	FreeVRAM     uint64    `gorm:"column:free_vram" json:"free_vram"`
+	ReservedVRAM uint64    `gorm:"column:reserved_vram;default:0" json:"reserved_vram"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+func (NodeGPU) TableName() string { return "node_gpus" }
+
+// ModelVRAMEstimate caches the VRAM footprint of a model, keyed by model name.
+// source is "heuristic" (file-size seed) or "measured" (observed after a load).
+// A measured row always overwrites a heuristic one; this drives auto multi-GPU
+// span decisions in the scheduler.
+type ModelVRAMEstimate struct {
+	ModelName        string    `gorm:"primaryKey;size:255" json:"model_name"`
+	Backend          string    `gorm:"size:128" json:"backend"`
+	VRAMBytes        uint64    `gorm:"column:vram_bytes" json:"vram_bytes"`
+	Source           string    `gorm:"size:16" json:"source"`
+	GPUCountObserved int       `gorm:"column:gpu_count_observed;default:1" json:"gpu_count_observed"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+func (ModelVRAMEstimate) TableName() string { return "model_vram_estimates" }
 
 // ModelLoadInfo is per-model load metadata kept independently of NodeModel rows
 // so the Replica Reconciler can re-load a model after every replica row has
@@ -263,7 +294,7 @@ func (r *NodeRegistry) nodeModelNames(ctx context.Context, db *gorm.DB, nodeID s
 // when multiple instances (frontend + workers) start at the same time.
 func NewNodeRegistry(db *gorm.DB) (*NodeRegistry, error) {
 	if err := advisorylock.WithLockCtx(context.Background(), db, advisorylock.KeySchemaMigrate, func() error {
-		return db.AutoMigrate(&BackendNode{}, &NodeModel{}, &NodeLabel{}, &ModelSchedulingConfig{}, &PendingBackendOp{}, &ModelLoadInfo{})
+		return db.AutoMigrate(&BackendNode{}, &NodeModel{}, &NodeLabel{}, &ModelSchedulingConfig{}, &PendingBackendOp{}, &ModelLoadInfo{}, &NodeGPU{}, &ModelVRAMEstimate{})
 	}); err != nil {
 		return nil, fmt.Errorf("migrating node tables: %w", err)
 	}
@@ -549,6 +580,83 @@ func (r *NodeRegistry) ReleaseVRAM(ctx context.Context, nodeID string, bytes uin
 		UpdateColumn(ColReservedVRAM, gorm.Expr("reserved_vram - ?", bytes)).Error
 }
 
+// ReserveVRAMOnGPU atomically deducts a soft reservation from one GPU's
+// effectively-free VRAM (free - reserved). Mirrors ReserveVRAM but per-GPU.
+func (r *NodeRegistry) ReserveVRAMOnGPU(ctx context.Context, nodeID string, gpuIndex int, bytes uint64) error {
+	if bytes == 0 {
+		return nil
+	}
+	res := r.db.WithContext(ctx).Model(&NodeGPU{}).
+		Where("node_id = ? AND gpu_index = ? AND (free_vram - reserved_vram) >= ?", nodeID, gpuIndex, bytes).
+		UpdateColumn("reserved_vram", gorm.Expr("reserved_vram + ?", bytes))
+	if res.Error != nil {
+		return fmt.Errorf("reserving %d bytes on node %s gpu %d: %w", bytes, nodeID, gpuIndex, res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrInsufficientVRAM
+	}
+	return nil
+}
+
+// ReleaseVRAMOnGPU returns a per-GPU soft reservation (rollback on failed load).
+func (r *NodeRegistry) ReleaseVRAMOnGPU(ctx context.Context, nodeID string, gpuIndex int, bytes uint64) error {
+	if bytes == 0 {
+		return nil
+	}
+	return r.db.WithContext(ctx).Model(&NodeGPU{}).
+		Where("node_id = ? AND gpu_index = ? AND reserved_vram >= ?", nodeID, gpuIndex, bytes).
+		UpdateColumn("reserved_vram", gorm.Expr("reserved_vram - ?", bytes)).Error
+}
+
+// NodeGPUs returns the node's GPUs ordered by index.
+func (r *NodeRegistry) NodeGPUs(ctx context.Context, nodeID string) ([]NodeGPU, error) {
+	var gpus []NodeGPU
+	err := r.db.WithContext(ctx).Where("node_id = ?", nodeID).Order("gpu_index ASC").Find(&gpus).Error
+	return gpus, err
+}
+
+// CandidateNodesByFreeVRAM returns healthy backend nodes (optionally filtered to
+// nodeIDs) ordered by effectively-free node-level VRAM (available - reserved)
+// descending. The per-GPU placement loop walks this order and asks planGPUSet
+// to fit a model on the most-free node first.
+func (r *NodeRegistry) CandidateNodesByFreeVRAM(ctx context.Context, nodeIDs []string) ([]BackendNode, error) {
+	q := r.db.WithContext(ctx).
+		Where("status = ? AND node_type = ?", StatusHealthy, NodeTypeBackend)
+	if len(nodeIDs) > 0 {
+		q = q.Where("id IN ?", nodeIDs)
+	}
+	var nodes []BackendNode
+	err := q.Order("(available_vram - reserved_vram) DESC").Find(&nodes).Error
+	return nodes, err
+}
+
+// GetModelVRAMEstimate returns the cached estimate for a model, or
+// gorm.ErrRecordNotFound if none exists.
+func (r *NodeRegistry) GetModelVRAMEstimate(ctx context.Context, modelName string) (*ModelVRAMEstimate, error) {
+	var e ModelVRAMEstimate
+	if err := r.db.WithContext(ctx).Where("model_name = ?", modelName).First(&e).Error; err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+// UpsertModelVRAMEstimate writes (or overwrites) the cached estimate. A
+// "measured" source always wins over a "heuristic" one; a fresh "heuristic"
+// must NOT clobber an existing "measured" value.
+func (r *NodeRegistry) UpsertModelVRAMEstimate(ctx context.Context, modelName, backend string, bytes uint64, source string, gpuCount int) error {
+	if source == "heuristic" {
+		// Don't downgrade a measured row back to a heuristic seed.
+		if existing, err := r.GetModelVRAMEstimate(ctx, modelName); err == nil && existing.Source == "measured" {
+			return nil
+		}
+	}
+	row := ModelVRAMEstimate{ModelName: modelName, Backend: backend, VRAMBytes: bytes, Source: source, GPUCountObserved: gpuCount, UpdatedAt: time.Now()}
+	return r.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "model_name"}},
+		DoUpdates: clause.AssignmentColumns([]string{"backend", "vram_bytes", "source", "gpu_count_observed", "updated_at"}),
+	}).Create(&row).Error
+}
+
 // Deregister removes a backend node, its model associations, and any auto-provisioned auth credentials.
 func (r *NodeRegistry) Deregister(ctx context.Context, nodeID string) error {
 	db := r.db.WithContext(ctx)
@@ -586,12 +694,21 @@ func (r *NodeRegistry) Deregister(ctx context.Context, nodeID string) error {
 	return nil
 }
 
+// GPUHeartbeat is one GPU's VRAM reading in a heartbeat payload.
+type GPUHeartbeat struct {
+	Index     int    `json:"index"`
+	TotalVRAM uint64 `json:"total_vram"`
+	FreeVRAM  uint64 `json:"free_vram"`
+	UsedVRAM  uint64 `json:"used_vram"`
+}
+
 // HeartbeatUpdate contains optional fields to update on heartbeat.
 type HeartbeatUpdate struct {
-	AvailableVRAM *uint64 `json:"available_vram,omitempty"`
-	TotalVRAM     *uint64 `json:"total_vram,omitempty"`
-	AvailableRAM  *uint64 `json:"available_ram,omitempty"`
-	GPUVendor     string  `json:"gpu_vendor,omitempty"`
+	AvailableVRAM *uint64        `json:"available_vram,omitempty"`
+	TotalVRAM     *uint64        `json:"total_vram,omitempty"`
+	AvailableRAM  *uint64        `json:"available_ram,omitempty"`
+	GPUVendor     string         `json:"gpu_vendor,omitempty"`
+	GPUs          []GPUHeartbeat `json:"gpus,omitempty"`
 }
 
 // Heartbeat updates the heartbeat timestamp and status for a node.
@@ -639,6 +756,19 @@ func (r *NodeRegistry) Heartbeat(ctx context.Context, nodeID string, update *Hea
 		}
 		if result.RowsAffected == 0 {
 			return fmt.Errorf("node %s not found", nodeID)
+		}
+	}
+	if update != nil && len(update.GPUs) > 0 {
+		for _, g := range update.GPUs {
+			// Worker is source of truth: refresh free/total and clear the
+			// in-tick reservation. ON CONFLICT updates the existing row.
+			row := NodeGPU{NodeID: nodeID, GPUIndex: g.Index, TotalVRAM: g.TotalVRAM, FreeVRAM: g.FreeVRAM, ReservedVRAM: 0, UpdatedAt: time.Now()}
+			if err := db.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "node_id"}, {Name: "gpu_index"}},
+				DoUpdates: clause.AssignmentColumns([]string{"total_vram", "free_vram", "reserved_vram", "updated_at"}),
+			}).Create(&row).Error; err != nil {
+				xlog.Warn("Failed to upsert node GPU", "node", nodeID, "gpu", g.Index, "error", err)
+			}
 		}
 	}
 	return nil
@@ -739,7 +869,7 @@ func (r *NodeRegistry) FindStaleNodes(ctx context.Context, threshold time.Durati
 // SetNodeModel records that a replica of a model is loaded on a node.
 // replicaIndex identifies which slot on the node this replica occupies
 // (0..MaxReplicasPerModel-1). Pass 0 for single-replica scheduling.
-func (r *NodeRegistry) SetNodeModel(ctx context.Context, nodeID, modelName string, replicaIndex int, state, address string, initialInFlight int) error {
+func (r *NodeRegistry) SetNodeModel(ctx context.Context, nodeID, modelName string, replicaIndex int, state, address string, initialInFlight int, gpuIndices string) error {
 	now := time.Now()
 	// Use Attrs for creation-only fields (ID) and Assign for update-only fields.
 	// Attrs is applied only when creating a new record. Assign is applied on
@@ -748,7 +878,7 @@ func (r *NodeRegistry) SetNodeModel(ctx context.Context, nodeID, modelName strin
 	var nm NodeModel
 	result := r.db.WithContext(ctx).Where("node_id = ? AND model_name = ? AND replica_index = ?", nodeID, modelName, replicaIndex).
 		Attrs(NodeModel{ID: uuid.New().String(), NodeID: nodeID, ModelName: modelName, ReplicaIndex: replicaIndex}).
-		Assign(map[string]any{"address": address, "state": state, "last_used": now, "in_flight": initialInFlight}).
+		Assign(map[string]any{"address": address, "state": state, "last_used": now, "in_flight": initialInFlight, "gpu_indices": gpuIndices}).
 		FirstOrCreate(&nm)
 	return result.Error
 }

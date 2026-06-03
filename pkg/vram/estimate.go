@@ -12,6 +12,7 @@ import (
 
 var weightExts = map[string]bool{
 	".gguf": true, ".safetensors": true, ".bin": true, ".pt": true,
+	".pth": true, ".ckpt": true,
 }
 
 func IsWeightFile(nameOrURI string) bool {
@@ -26,9 +27,9 @@ func IsGGUF(nameOrURI string) bool {
 // modelProfile captures the "fixed" properties of a model after I/O.
 // Everything except context length is constant for a given model.
 type modelProfile struct {
-	sizeBytes    uint64    // total weight file size
-	ggufSize     uint64    // GGUF file size (subset of sizeBytes)
-	meta         *GGUFMeta // nil if no GGUF metadata available
+	sizeBytes uint64    // total weight file size
+	ggufSize  uint64    // GGUF file size (subset of sizeBytes)
+	meta      *GGUFMeta // nil if no GGUF metadata available
 }
 
 // resolveProfile does all I/O: iterates files, fetches sizes and GGUF metadata.
@@ -142,7 +143,6 @@ func buildEstimates(p modelProfile, contextSizes []uint32, opts EstimateOptions)
 	}
 	return m
 }
-
 
 // EstimateMultiContext estimates model size and VRAM at multiple context sizes.
 // It performs I/O once (resolveProfile) then computes VRAM for each context size.

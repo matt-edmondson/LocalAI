@@ -93,7 +93,7 @@ func (ml *ModelLoader) grpcModel(backend string, o *Options) func(string, string
 					return nil, fmt.Errorf("failed allocating free ports: %s", err.Error())
 				}
 				// Make sure the process is executable
-				process, err := ml.startProcess(uri, modelID, serverAddress)
+				process, err := ml.startProcess(uri, modelID, serverAddress, nil)
 				if err != nil {
 					xlog.Error("failed to launch", "error", err, "path", uri)
 					return nil, err

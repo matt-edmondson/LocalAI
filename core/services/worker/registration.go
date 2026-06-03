@@ -126,9 +126,21 @@ func (cfg *Config) registrationBody() map[string]any {
 // free capacity.
 func (cfg *Config) heartbeatBody() map[string]any {
 	body := map[string]any{}
+	gpus := xsysinfo.GetGPUMemoryUsage()
 	aggregate := xsysinfo.GetGPUAggregateInfo()
 	if aggregate.TotalVRAM > 0 {
 		body["available_vram"] = aggregate.FreeVRAM
+		// Per-GPU detail lets the scheduler reason per-card instead of summing.
+		perGPU := make([]map[string]any, 0, len(gpus))
+		for _, g := range gpus {
+			perGPU = append(perGPU, map[string]any{
+				"index":      g.Index,
+				"total_vram": g.TotalVRAM,
+				"free_vram":  g.FreeVRAM,
+				"used_vram":  g.UsedVRAM,
+			})
+		}
+		body["gpus"] = perGPU
 	}
 
 	// CPU-only workers (or workers that lost GPU visibility momentarily):

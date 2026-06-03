@@ -50,7 +50,7 @@ func (f *fakeModelRouterForSmartRouter) RemoveAllNodeModelReplicas(_ context.Con
 	return nil
 }
 func (f *fakeModelRouterForSmartRouter) TouchNodeModel(_ context.Context, _, _ string, _ int) {}
-func (f *fakeModelRouterForSmartRouter) SetNodeModel(_ context.Context, _, _ string, _ int, _, _ string, _ int) error {
+func (f *fakeModelRouterForSmartRouter) SetNodeModel(_ context.Context, _, _ string, _ int, _, _ string, _ int, _ string) error {
 	return nil
 }
 func (f *fakeModelRouterForSmartRouter) SetNodeModelLoadInfo(_ context.Context, _, _ string, _ int, _ string, _ []byte) error {
@@ -123,6 +123,24 @@ func (f *fakeModelRouterForSmartRouter) FindNodesWithModel(_ context.Context, _ 
 }
 func (f *fakeModelRouterForSmartRouter) LoadedReplicaStats(_ context.Context, _ string, _ []string) ([]ReplicaCandidate, error) {
 	return nil, nil
+}
+func (f *fakeModelRouterForSmartRouter) GetModelVRAMEstimate(_ context.Context, _ string) (*ModelVRAMEstimate, error) {
+	return nil, fmt.Errorf("not found")
+}
+func (f *fakeModelRouterForSmartRouter) UpsertModelVRAMEstimate(_ context.Context, _, _ string, _ uint64, _ string, _ int) error {
+	return nil
+}
+func (f *fakeModelRouterForSmartRouter) NodeGPUs(_ context.Context, _ string) ([]NodeGPU, error) {
+	return nil, nil
+}
+func (f *fakeModelRouterForSmartRouter) CandidateNodesByFreeVRAM(_ context.Context, _ []string) ([]BackendNode, error) {
+	return nil, nil
+}
+func (f *fakeModelRouterForSmartRouter) ReserveVRAMOnGPU(_ context.Context, _ string, _ int, _ uint64) error {
+	return nil
+}
+func (f *fakeModelRouterForSmartRouter) ReleaseVRAMOnGPU(_ context.Context, _ string, _ int, _ uint64) error {
+	return nil
 }
 
 // Compile-time check

@@ -158,7 +158,7 @@ func (s *backendSupervisor) installBackend(req messaging.BackendInstallRequest, 
 	xlog.Info("Found backend binary", "path", backendPath, "processKey", processKey)
 
 	// Start the gRPC process on a new port (keyed by model, not just backend)
-	return s.startBackend(processKey, backendPath)
+	return s.startBackend(processKey, backendPath, req.GPUIndices)
 }
 
 // upgradeBackend stops every running process for `backend`, force-reinstalls

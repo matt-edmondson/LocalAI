@@ -107,11 +107,11 @@ var _ = Describe("ReplicaReconciler", func() {
 			setSchedulingConfig("model-b", 1, 4, "")
 
 			// Load 2 replicas, both busy (in_flight > 0)
-			Expect(registry.SetNodeModel(context.Background(), node.ID, "model-b", 0, "loaded", "addr1", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node.ID, "model-b", 0, "loaded", "addr1", 0, "")).To(Succeed())
 			Expect(registry.IncrementInFlight(context.Background(), node.ID, "model-b", 0)).To(Succeed())
 
 			node2 := registerNode("node-busy-2", "10.0.0.3:50051")
-			Expect(registry.SetNodeModel(context.Background(), node2.ID, "model-b", 0, "loaded", "addr2", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node2.ID, "model-b", 0, "loaded", "addr2", 0, "")).To(Succeed())
 			Expect(registry.IncrementInFlight(context.Background(), node2.ID, "model-b", 0)).To(Succeed())
 
 			scheduler := &fakeScheduler{
@@ -136,11 +136,11 @@ var _ = Describe("ReplicaReconciler", func() {
 			setSchedulingConfig("model-c", 1, 2, "")
 
 			// Load 2 replicas (at max), both busy
-			Expect(registry.SetNodeModel(context.Background(), node.ID, "model-c", 0, "loaded", "addr1", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node.ID, "model-c", 0, "loaded", "addr1", 0, "")).To(Succeed())
 			Expect(registry.IncrementInFlight(context.Background(), node.ID, "model-c", 0)).To(Succeed())
 
 			node2 := registerNode("node-max-2", "10.0.0.5:50051")
-			Expect(registry.SetNodeModel(context.Background(), node2.ID, "model-c", 0, "loaded", "addr2", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node2.ID, "model-c", 0, "loaded", "addr2", 0, "")).To(Succeed())
 			Expect(registry.IncrementInFlight(context.Background(), node2.ID, "model-c", 0)).To(Succeed())
 
 			scheduler := &fakeScheduler{
@@ -168,7 +168,7 @@ var _ = Describe("ReplicaReconciler", func() {
 			// Load 3 replicas, all idle with last_used in the past
 			pastTime := time.Now().Add(-10 * time.Minute)
 			for _, n := range []*BackendNode{node1, node2, node3} {
-				Expect(registry.SetNodeModel(context.Background(), n.ID, "model-d", 0, "loaded", "", 0)).To(Succeed())
+				Expect(registry.SetNodeModel(context.Background(), n.ID, "model-d", 0, "loaded", "", 0, "")).To(Succeed())
 				// Set last_used to past time to trigger scale-down
 				db.Model(&NodeModel{}).Where("node_id = ? AND model_name = ?", n.ID, "model-d").
 					Update("last_used", pastTime)
@@ -198,7 +198,7 @@ var _ = Describe("ReplicaReconciler", func() {
 			// Load exactly 2 replicas (at min), both idle with past last_used
 			pastTime := time.Now().Add(-10 * time.Minute)
 			for _, n := range []*BackendNode{node1, node2} {
-				Expect(registry.SetNodeModel(context.Background(), n.ID, "model-e", 0, "loaded", "", 0)).To(Succeed())
+				Expect(registry.SetNodeModel(context.Background(), n.ID, "model-e", 0, "loaded", "", 0, "")).To(Succeed())
 				db.Model(&NodeModel{}).Where("node_id = ? AND model_name = ?", n.ID, "model-e").
 					Update("last_used", pastTime)
 			}
@@ -253,7 +253,7 @@ var _ = Describe("ReplicaReconciler", func() {
 			// all-busy path does not fire). Pressure for the model is above the
 			// threshold, which is the only reason to scale here.
 			node := registerNode("pressure-node", "10.0.0.60:50051")
-			Expect(registry.SetNodeModel(context.Background(), node.ID, "pressure-model", 0, "loaded", "addr1", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node.ID, "pressure-model", 0, "loaded", "addr1", 0, "")).To(Succeed())
 			setSchedulingConfig("pressure-model", 1, 4, "")
 
 			pressure := prefixcache.NewPressure(time.Minute)
@@ -279,8 +279,8 @@ var _ = Describe("ReplicaReconciler", func() {
 			// high but MaxReplicas must never be overridden.
 			node1 := registerNode("pmax-1", "10.0.0.61:50051")
 			node2 := registerNode("pmax-2", "10.0.0.62:50051")
-			Expect(registry.SetNodeModel(context.Background(), node1.ID, "pmax-model", 0, "loaded", "addr1", 0)).To(Succeed())
-			Expect(registry.SetNodeModel(context.Background(), node2.ID, "pmax-model", 0, "loaded", "addr2", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node1.ID, "pmax-model", 0, "loaded", "addr1", 0, "")).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node2.ID, "pmax-model", 0, "loaded", "addr2", 0, "")).To(Succeed())
 			setSchedulingConfig("pmax-model", 1, 2, "")
 
 			pressure := prefixcache.NewPressure(time.Minute)
@@ -309,7 +309,7 @@ var _ = Describe("ReplicaReconciler", func() {
 			// non-draining Count keeps returning >= threshold every tick and
 			// drives the model toward MaxReplicas off a single burst.
 			node := registerNode("consume-node", "10.0.0.64:50051")
-			Expect(registry.SetNodeModel(context.Background(), node.ID, "consume-model", 0, "loaded", "addr1", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node.ID, "consume-model", 0, "loaded", "addr1", 0, "")).To(Succeed())
 			setSchedulingConfig("consume-model", 1, 4, "")
 
 			pressure := prefixcache.NewPressure(time.Minute)
@@ -345,7 +345,7 @@ var _ = Describe("ReplicaReconciler", func() {
 			// scale-up off the same accumulated pressure, instead of having to
 			// re-accumulate a full window of forced-disturbs from scratch.
 			node := registerNode("fail-node", "10.0.0.66:50051")
-			Expect(registry.SetNodeModel(context.Background(), node.ID, "fail-model", 0, "loaded", "addr1", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node.ID, "fail-model", 0, "loaded", "addr1", 0, "")).To(Succeed())
 			setSchedulingConfig("fail-model", 1, 4, "")
 
 			pressure := prefixcache.NewPressure(time.Minute)
@@ -377,7 +377,7 @@ var _ = Describe("ReplicaReconciler", func() {
 			// replica is actually added, the forced-disturb signal IS consumed
 			// (Reset to 0) so a single burst scales up only once.
 			node := registerNode("ok-node", "10.0.0.67:50051")
-			Expect(registry.SetNodeModel(context.Background(), node.ID, "ok-model", 0, "loaded", "addr1", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node.ID, "ok-model", 0, "loaded", "addr1", 0, "")).To(Succeed())
 			setSchedulingConfig("ok-model", 1, 4, "")
 
 			pressure := prefixcache.NewPressure(time.Minute)
@@ -408,7 +408,7 @@ var _ = Describe("ReplicaReconciler", func() {
 			// the same tick. The invariant is at-most-one scaleUp(+1) per tick,
 			// so exactly one schedule call must happen, not two.
 			node := registerNode("dual-node", "10.0.0.65:50051")
-			Expect(registry.SetNodeModel(context.Background(), node.ID, "dual-model", 0, "loaded", "addr1", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node.ID, "dual-model", 0, "loaded", "addr1", 0, "")).To(Succeed())
 			Expect(registry.IncrementInFlight(context.Background(), node.ID, "dual-model", 0)).To(Succeed())
 			setSchedulingConfig("dual-model", 1, 4, "")
 
@@ -444,7 +444,7 @@ var _ = Describe("ReplicaReconciler", func() {
 				return node
 			}
 			node := registerCappedNodeFn("pcap-node", "10.0.0.63:50051", 1)
-			Expect(registry.SetNodeModel(context.Background(), node.ID, "pcap-model", 0, "loaded", "addr1", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node.ID, "pcap-model", 0, "loaded", "addr1", 0, "")).To(Succeed())
 			// MaxReplicas high enough that replicas<max, so only capacity guards it.
 			setSchedulingConfig("pcap-model", 1, 4, "")
 
@@ -512,7 +512,7 @@ var _ = Describe("ReplicaReconciler", func() {
 			// threshold the cooldown timestamp is set and further ticks
 			// short-circuit (the scheduler is no longer called).
 			node := registerCappedNode("cb-node", "10.0.0.41:50051", 1)
-			Expect(registry.SetNodeModel(context.Background(), node.ID, "cb-model", 0, "loaded", "addr1", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node.ID, "cb-model", 0, "loaded", "addr1", 0, "")).To(Succeed())
 			Expect(registry.SetModelScheduling(context.Background(), &ModelSchedulingConfig{
 				ModelName:   "cb-model",
 				MinReplicas: 2,
@@ -579,7 +579,7 @@ var _ = Describe("ReplicaReconciler", func() {
 			// second node simulates the user's recovery question: capacity
 			// returns, cooldown clears, the next tick schedules.
 			node1 := registerCappedNode("rec-node-1", "10.0.0.43:50051", 1)
-			Expect(registry.SetNodeModel(context.Background(), node1.ID, "rec-model", 0, "loaded", "addr1", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node1.ID, "rec-model", 0, "loaded", "addr1", 0, "")).To(Succeed())
 
 			until := time.Now().Add(unsatisfiableCooldown)
 			Expect(registry.SetModelScheduling(context.Background(), &ModelSchedulingConfig{
@@ -631,8 +631,8 @@ var _ = Describe("ReplicaReconciler", func() {
 			Expect(registry.Register(context.Background(), b, true)).To(Succeed())
 			Expect(registry.Register(context.Background(), c, true)).To(Succeed())
 
-			Expect(registry.SetNodeModel(context.Background(), a.ID, "cap-model", 0, "loaded", "x", 0)).To(Succeed())
-			Expect(registry.SetNodeModel(context.Background(), c.ID, "cap-model", 0, "loaded", "y", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), a.ID, "cap-model", 0, "loaded", "x", 0, "")).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), c.ID, "cap-model", 0, "loaded", "y", 0, "")).To(Succeed())
 
 			cap, err := registry.ClusterCapacityForModel(context.Background(), "cap-model", nil)
 			Expect(err).ToNot(HaveOccurred())

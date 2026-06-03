@@ -494,7 +494,7 @@ func (d *DistributedBackendManager) InstallBackend(ctx context.Context, op *gall
 		// Admin-driven backend install: not tied to a specific replica slot.
 		// Pass replica 0 - the worker's processKey is "backend#0" when no
 		// modelID is supplied, matching pre-PR4 behavior.
-		reply, err := d.adapter.InstallBackend(node.ID, backendName, "", string(galleriesJSON), op.ExternalURI, op.ExternalName, op.ExternalAlias, 0, op.ID, onProgressArg)
+		reply, err := d.adapter.InstallBackend(node.ID, backendName, "", string(galleriesJSON), op.ExternalURI, op.ExternalName, op.ExternalAlias, 0, nil, op.ID, onProgressArg)
 		if err != nil {
 			return err
 		}

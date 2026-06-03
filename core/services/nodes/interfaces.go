@@ -15,7 +15,7 @@ type ModelRouter interface {
 	RemoveNodeModel(ctx context.Context, nodeID, modelName string, replicaIndex int) error
 	RemoveAllNodeModelReplicas(ctx context.Context, nodeID, modelName string) error
 	TouchNodeModel(ctx context.Context, nodeID, modelName string, replicaIndex int)
-	SetNodeModel(ctx context.Context, nodeID, modelName string, replicaIndex int, state, address string, initialInFlight int) error
+	SetNodeModel(ctx context.Context, nodeID, modelName string, replicaIndex int, state, address string, initialInFlight int, gpuIndices string) error
 	SetNodeModelLoadInfo(ctx context.Context, nodeID, modelName string, replicaIndex int, backendType string, optsBlob []byte) error
 	UpsertModelLoadInfo(ctx context.Context, modelName, backendType string, optsBlob []byte) error
 	GetModelLoadInfo(ctx context.Context, modelName string) (backendType string, optsBlob []byte, err error)
@@ -38,6 +38,12 @@ type ModelRouter interface {
 	GetNodeLabels(ctx context.Context, nodeID string) ([]NodeLabel, error)
 	FindNodesWithModel(ctx context.Context, modelName string) ([]BackendNode, error)
 	LoadedReplicaStats(ctx context.Context, modelName string, candidateNodeIDs []string) ([]ReplicaCandidate, error)
+	GetModelVRAMEstimate(ctx context.Context, modelName string) (*ModelVRAMEstimate, error)
+	UpsertModelVRAMEstimate(ctx context.Context, modelName, backend string, bytes uint64, source string, gpuCount int) error
+	NodeGPUs(ctx context.Context, nodeID string) ([]NodeGPU, error)
+	CandidateNodesByFreeVRAM(ctx context.Context, nodeIDs []string) ([]BackendNode, error)
+	ReserveVRAMOnGPU(ctx context.Context, nodeID string, gpuIndex int, bytes uint64) error
+	ReleaseVRAMOnGPU(ctx context.Context, nodeID string, gpuIndex int, bytes uint64) error
 }
 
 // ConcurrencyConflictResolver returns the names of configured models that

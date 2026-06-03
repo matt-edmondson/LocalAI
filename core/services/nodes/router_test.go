@@ -60,6 +60,9 @@ func (f *fakeFileStager) ListRemoteDir(_ context.Context, _, _ string) ([]string
 
 // fakeModelRouter implements ModelRouter with configurable return values.
 type fakeModelRouter struct {
+	// mu guards all mutable fields so measurement goroutines don't race test assertions.
+	mu sync.Mutex
+
 	// FindAndLockNodeWithModel returns
 	findAndLockNode *BackendNode
 	findAndLockNM   *NodeModel
@@ -127,6 +130,35 @@ type fakeModelRouter struct {
 	// Preferences passed to FindAndLockNodeWithModel, in call order. nil
 	// entries are recorded too, so tests can assert "preference was nil".
 	findAndLockPrefs []*RoutePreference
+
+	// GetModelVRAMEstimate returns this value when non-nil; gorm.ErrRecordNotFound otherwise.
+	vramEstimate *ModelVRAMEstimate
+
+	// Per-GPU placement fakes (Task 3.4).
+	// candidateNodes is returned by CandidateNodesByFreeVRAM (already ordered).
+	candidateNodes []BackendNode
+	candidateErr   error
+	// nodeGPUs is returned by NodeGPUs for every node id (the mock-based tests
+	// model a single node, so one slice suffices).
+	nodeGPUs    []NodeGPU
+	nodeGPUsErr error
+
+	// nodeGPUsSeq is an optional sequence of snapshots for NodeGPUs. When non-empty,
+	// each call to NodeGPUs pops and returns the first entry; the last entry repeats.
+	// Falls back to nodeGPUs when empty.
+	nodeGPUsSeq [][]NodeGPU
+
+	// lastUpsert captures the most recent UpsertModelVRAMEstimate call with
+	// source=="measured". Protected by mu.
+	lastUpsert *ModelVRAMEstimate
+
+	// lastHeuristicUpsert captures the most recent UpsertModelVRAMEstimate call
+	// with source=="heuristic". Protected by mu.
+	lastHeuristicUpsert *ModelVRAMEstimate
+
+	// lastEstimateKey captures the model name argument passed to the most
+	// recent GetModelVRAMEstimate call. Protected by mu.
+	lastEstimateKey string
 }
 
 func (f *fakeModelRouter) FindAndLockNodeWithModel(_ context.Context, modelName string, _ []string, pref *RoutePreference) (*BackendNode, *NodeModel, error) {
@@ -168,7 +200,7 @@ func (f *fakeModelRouter) TouchNodeModel(_ context.Context, nodeID, modelName st
 	f.touchCalls = append(f.touchCalls, nodeID+":"+modelName)
 }
 
-func (f *fakeModelRouter) SetNodeModel(_ context.Context, nodeID, modelName string, _ int, state, address string, _ int) error {
+func (f *fakeModelRouter) SetNodeModel(_ context.Context, nodeID, modelName string, _ int, state, address string, _ int, _ string) error {
 	f.setCalls = append(f.setCalls, fmt.Sprintf("%s:%s:%s:%s", nodeID, modelName, state, address))
 	return nil
 }
@@ -262,6 +294,60 @@ func (f *fakeModelRouter) FindNodesWithModel(_ context.Context, modelName string
 	return f.findNodesWithModelByName[modelName], nil
 }
 
+func (f *fakeModelRouter) GetModelVRAMEstimate(_ context.Context, modelName string) (*ModelVRAMEstimate, error) {
+	f.mu.Lock()
+	f.lastEstimateKey = modelName
+	f.mu.Unlock()
+	if f.vramEstimate == nil {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return f.vramEstimate, nil
+}
+
+func (f *fakeModelRouter) UpsertModelVRAMEstimate(_ context.Context, modelName, backend string, bytes uint64, source string, gpuCount int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	est := &ModelVRAMEstimate{
+		ModelName:        modelName,
+		Backend:          backend,
+		VRAMBytes:        bytes,
+		Source:           source,
+		GPUCountObserved: gpuCount,
+	}
+	if source == "measured" {
+		f.lastUpsert = est
+	}
+	if source == "heuristic" {
+		f.lastHeuristicUpsert = est
+	}
+	return nil
+}
+
+func (f *fakeModelRouter) CandidateNodesByFreeVRAM(_ context.Context, _ []string) ([]BackendNode, error) {
+	return f.candidateNodes, f.candidateErr
+}
+
+func (f *fakeModelRouter) NodeGPUs(_ context.Context, _ string) ([]NodeGPU, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.nodeGPUsSeq) > 0 {
+		snap := f.nodeGPUsSeq[0]
+		if len(f.nodeGPUsSeq) > 1 {
+			f.nodeGPUsSeq = f.nodeGPUsSeq[1:]
+		}
+		return snap, f.nodeGPUsErr
+	}
+	return f.nodeGPUs, f.nodeGPUsErr
+}
+
+func (f *fakeModelRouter) ReserveVRAMOnGPU(_ context.Context, _ string, _ int, _ uint64) error {
+	return nil
+}
+
+func (f *fakeModelRouter) ReleaseVRAMOnGPU(_ context.Context, _ string, _ int, _ uint64) error {
+	return nil
+}
+
 // fakeConflictResolver implements ConcurrencyConflictResolver from a static map.
 type fakeConflictResolver struct {
 	conflicts map[string][]string
@@ -333,6 +419,10 @@ type fakeUnloader struct {
 	stopErr     error
 	unloadCalls []string
 	unloadErr   error
+
+	// lastInstallGPUIndices captures the GPU indices the scheduler pinned on
+	// the most recent InstallBackend call (Task 3.4).
+	lastInstallGPUIndices []int
 }
 
 // installCall captures the args we care about when asserting that the
@@ -352,7 +442,7 @@ type upgradeCall struct {
 	replica int
 }
 
-func (f *fakeUnloader) InstallBackend(nodeID, backend, modelID, _, _, _, _ string, replica int, _ string, _ func(messaging.BackendInstallProgressEvent)) (*messaging.BackendInstallReply, error) {
+func (f *fakeUnloader) InstallBackend(nodeID, backend, modelID, _, _, _, _ string, replica int, gpuIndices []int, _ string, _ func(messaging.BackendInstallProgressEvent)) (*messaging.BackendInstallReply, error) {
 	// installHook intentionally runs OUTSIDE the mutex: the hook may block
 	// on a channel and we don't want to serialize concurrent callers,
 	// which would defeat the singleflight-overlap test.
@@ -361,6 +451,7 @@ func (f *fakeUnloader) InstallBackend(nodeID, backend, modelID, _, _, _, _ strin
 	}
 	f.mu.Lock()
 	f.installCalls = append(f.installCalls, installCall{nodeID, backend, modelID, replica})
+	f.lastInstallGPUIndices = gpuIndices
 	f.mu.Unlock()
 	return f.installReply, f.installErr
 }
@@ -610,7 +701,7 @@ var _ = Describe("SmartRouter", func() {
 			router := NewSmartRouter(reg, SmartRouterOptions{
 				Unloader:      unloader,
 				ClientFactory: factory,
-				VRAMEstimator: func(_ context.Context, _ *pb.ModelOptions) uint64 {
+				VRAMEstimator: func(_ context.Context, _ string, _ *pb.ModelOptions) uint64 {
 					return 25 * 1024 * 1024 * 1024 // 25 GiB — more than any test node has
 				},
 				// DB nil → eviction returns ErrEvictionBusy, so Route fails.
@@ -622,6 +713,233 @@ var _ = Describe("SmartRouter", func() {
 			// Must NOT have picked the known-too-small idle / least-loaded nodes.
 			Expect(err.Error()).ToNot(ContainSubstring("small-but-idle"))
 			Expect(err.Error()).ToNot(ContainSubstring("small-but-ll"))
+		})
+	})
+
+	Describe("per-GPU placement (mock-based)", func() {
+		const GiB = uint64(1) << 30
+
+		It("places a single-GPU model on the free GPU, not the full one", func() {
+			node := &BackendNode{ID: "n", Name: "noctis", Status: StatusHealthy, NodeType: NodeTypeBackend}
+			reg := &fakeModelRouter{
+				findAndLockErr: errors.New("not found"),
+				candidateNodes: []BackendNode{*node},
+				nodeGPUs: []NodeGPU{
+					{NodeID: "n", GPUIndex: 0, FreeVRAM: 200 << 20}, // GPU0 full
+					{NodeID: "n", GPUIndex: 1, FreeVRAM: 11 * GiB},  // GPU1 free
+				},
+				vramEstimate: &ModelVRAMEstimate{ModelName: "m", VRAMBytes: 7 * GiB, Source: "measured"},
+			}
+			unloader := &fakeUnloader{
+				installReply: &messaging.BackendInstallReply{Success: true, Address: "10.0.0.1:9001"},
+			}
+			router := NewSmartRouter(reg, SmartRouterOptions{
+				Unloader:      unloader,
+				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
+			})
+
+			gotNode, _, _, gpuSet, err := router.scheduleNewModel(context.Background(), "diffusers", "m", &pb.ModelOptions{Model: "m"})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(gotNode.ID).To(Equal("n"))
+			Expect(gpuSet).To(Equal([]int{1}))
+			// The pinned index must reach the worker via backend.install.
+			Expect(unloader.lastInstallGPUIndices).To(Equal([]int{1}))
+		})
+
+		// Task 3.5: terminal error when a real estimate exceeds every GPU set.
+		It("returns a clear terminal error when no GPU set on any node fits the estimate", func() {
+			// One node with 2 GiB free, model needs 40 GiB.
+			// sawPerGPUNode=true (node has GPU data), planGPUSet fails → eviction.
+			// DB=nil → evictLRUAndFreeNode returns ErrEvictionBusy every attempt.
+			// After the eviction loop, node==nil AND estimatedVRAM>0 → terminal error.
+			node := &BackendNode{ID: "n", Name: "small", Status: StatusHealthy, NodeType: NodeTypeBackend}
+			reg := &fakeModelRouter{
+				findAndLockErr: errors.New("not found"),
+				candidateNodes: []BackendNode{*node},
+				nodeGPUs:       []NodeGPU{{NodeID: "n", GPUIndex: 0, FreeVRAM: 2 * GiB}},
+				vramEstimate:   &ModelVRAMEstimate{ModelName: "big", VRAMBytes: 40 * GiB, Source: "measured"},
+			}
+			unloader := &fakeUnloader{
+				installReply: &messaging.BackendInstallReply{Success: true, Address: "10.0.0.1:9001"},
+			}
+			router := NewSmartRouter(reg, SmartRouterOptions{
+				Unloader:      unloader,
+				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
+				// DB intentionally nil: evictLRUAndFreeNode returns ErrEvictionBusy.
+			})
+
+			_, _, _, _, err := router.scheduleNewModel(context.Background(), "diffusers", "big", &pb.ModelOptions{Model: "big"})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("more VRAM than any GPU set"))
+		})
+
+		// Task 3.5: estimate==0 must never hard-fail — falls back to legacy placement.
+		It("falls back to legacy idle-node placement when estimate is zero and per-GPU data fits nothing", func() {
+			// Node has one GPU with zero effective-free VRAM → largestFreeGPU fails.
+			// vramEstimate=nil + no ModelFile → estimatedVRAM=0.
+			// After the per-GPU and mixed-version blocks both skip, node==nil AND
+			// estimatedVRAM==0 → legacy fallback to FindIdleNode succeeds.
+			legacyNode := &BackendNode{ID: "legacy", Name: "legacy-node", Status: StatusHealthy, NodeType: NodeTypeBackend}
+			reg := &fakeModelRouter{
+				findAndLockErr: errors.New("not found"),
+				candidateNodes: []BackendNode{{ID: "n", Name: "n", Status: StatusHealthy, NodeType: NodeTypeBackend}},
+				nodeGPUs:       []NodeGPU{{NodeID: "n", GPUIndex: 0, FreeVRAM: 0}},
+				// vramEstimate nil → GetModelVRAMEstimate returns gorm.ErrRecordNotFound → estimatedVRAM=0
+				findIdleNode: legacyNode,
+			}
+			unloader := &fakeUnloader{
+				installReply: &messaging.BackendInstallReply{Success: true, Address: "10.0.0.1:9001"},
+			}
+			router := NewSmartRouter(reg, SmartRouterOptions{
+				Unloader:      unloader,
+				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
+			})
+
+			gotNode, _, _, gpuSet, err := router.scheduleNewModel(context.Background(), "diffusers", "unknown-size", &pb.ModelOptions{Model: "unknown-size"})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(gotNode.ID).To(Equal("legacy"))
+			Expect(gpuSet).To(BeEmpty(), "legacy fallback must not pin a GPU (no estimate available)")
+		})
+
+		// Task 4.1: after a successful load, the VRAM footprint is measured and cached.
+		It("caches a measured VRAM estimate after a successful load (Task 4.1)", func() {
+			// Node has two GPUs: GPU0 is nearly full, GPU1 has 12 GiB free pre-load.
+			// The vramEstimate (6 GiB) is used for placement so the scheduler picks GPU1.
+			//
+			// NodeGPUs sequence:
+			//   call 1 (scheduleNewModel placement loop): pre snapshot — GPU1 free=12 GiB
+			//   call 2 (scheduleAndLoad pre-load capture): pre snapshot — GPU1 free=12 GiB
+			//   call 3+ (recordMeasuredVRAM post-load poll): post snapshot — GPU1 free=4 GiB
+			//
+			// Expected measured footprint: 12 GiB - 4 GiB = 8 GiB.
+			const GiB2 = uint64(1) << 30
+			preSnap := []NodeGPU{
+				{NodeID: "n", GPUIndex: 0, FreeVRAM: 200 << 20},
+				{NodeID: "n", GPUIndex: 1, FreeVRAM: 12 * GiB2},
+			}
+			postSnap := []NodeGPU{
+				{NodeID: "n", GPUIndex: 0, FreeVRAM: 200 << 20},
+				{NodeID: "n", GPUIndex: 1, FreeVRAM: 4 * GiB2},
+			}
+
+			node := &BackendNode{ID: "n", Name: "noctis", Status: StatusHealthy, NodeType: NodeTypeBackend}
+			f := &fakeModelRouter{
+				findAndLockErr: errors.New("not found"),
+				candidateNodes: []BackendNode{*node},
+				// Two pre-snapshots (placement + pre-capture), then post repeats.
+				nodeGPUsSeq: [][]NodeGPU{preSnap, preSnap, postSnap},
+				// 6 GiB measured estimate drives placement onto GPU1 (12 GiB free).
+				vramEstimate: &ModelVRAMEstimate{ModelName: "m", VRAMBytes: 6 * GiB2, Source: "measured"},
+			}
+			unloader := &fakeUnloader{
+				installReply: &messaging.BackendInstallReply{Success: true, Address: "10.0.0.1:9001"},
+			}
+			router := NewSmartRouter(f, SmartRouterOptions{
+				Unloader:      unloader,
+				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
+			})
+			// Speed up the measurement loop so the test finishes quickly.
+			router.measureSettleAttempts = 3
+			router.measureSettleDelay = time.Millisecond
+
+			result, err := router.scheduleAndLoad(context.Background(), "diffusers", "m", "m",
+				&pb.ModelOptions{Model: "m"}, false, 1)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.Node.ID).To(Equal("n"))
+			Expect(result.GPUSet).To(Equal([]int{1}))
+
+			// The measurement goroutine fires in the background; wait for it to write.
+			Eventually(func() *ModelVRAMEstimate {
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				return f.lastUpsert
+			}, "2s", "10ms").ShouldNot(BeNil())
+
+			f.mu.Lock()
+			upsert := f.lastUpsert
+			f.mu.Unlock()
+			Expect(upsert.Source).To(Equal("measured"))
+			Expect(upsert.VRAMBytes).To(Equal(8*GiB2), "expected 12 GiB - 4 GiB = 8 GiB footprint")
+		})
+
+		// Task 4.3: a model larger than any single GPU must span both GPUs on the node
+		// (incident regression: 2×A2000 node, 18 GiB model, GPU0 full + GPU1 empty → OOM loop).
+		It("spans a model larger than any single GPU across both GPUs (incident regression: large-model split)", func() {
+			// Each GPU has 11.6 GiB free — enough only when combined (2×11.6 = 23.2 GiB ≥ 18 GiB).
+			// planGPUSet must select both GPUs (span path), sorted ascending: [0,1].
+			const freePerGPU = uint64(11900) << 20 // ~11.6 GiB; each < 18 GiB
+			node := &BackendNode{ID: "noctis", Name: "noctis-2gpu", Status: StatusHealthy, NodeType: NodeTypeBackend}
+			reg := &fakeModelRouter{
+				findAndLockErr: errors.New("not found"),
+				candidateNodes: []BackendNode{*node},
+				nodeGPUs: []NodeGPU{
+					{NodeID: "noctis", GPUIndex: 0, FreeVRAM: freePerGPU},
+					{NodeID: "noctis", GPUIndex: 1, FreeVRAM: freePerGPU},
+				},
+				vramEstimate: &ModelVRAMEstimate{ModelName: "big-diffuser", VRAMBytes: 18 << 30, Source: "measured"},
+			}
+			unloader := &fakeUnloader{
+				installReply: &messaging.BackendInstallReply{Success: true, Address: "10.0.0.1:9001"},
+			}
+			router := NewSmartRouter(reg, SmartRouterOptions{
+				Unloader:      unloader,
+				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
+			})
+
+			gotNode, _, _, gpuSet, err := router.scheduleNewModel(context.Background(), "diffusers", "big-diffuser", &pb.ModelOptions{Model: "big-diffuser"})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(gotNode.ID).To(Equal("noctis"))
+			// Both GPUs must be selected (sorted ascending: [0,1]).
+			Expect(gpuSet).To(Equal([]int{0, 1}))
+			// The pinned indices must reach the worker via backend.install.
+			Expect(unloader.lastInstallGPUIndices).To(Equal([]int{0, 1}))
+
+			// Separately verify applyGPUSet sets the multi-GPU knobs correctly for k=2.
+			// (applyGPUSet is called in the load path on a cloned ModelOptions, not inside
+			// scheduleNewModel itself; we unit-assert it here to pin the TensorSplit behaviour.)
+			splitOpts := &pb.ModelOptions{}
+			applyGPUSet(splitOpts, len(gpuSet))
+			Expect(splitOpts.TensorParallelSize).To(Equal(int32(2)))
+			Expect(splitOpts.TensorSplit).To(Equal("1,1"))
+		})
+
+		// Task 4.2: on load failure, bump the heuristic VRAM estimate ×1.5.
+		It("bumps the cached heuristic VRAM estimate ×1.5 after a load failure (Task 4.2)", func() {
+			// Node has one GPU with 12 GiB free — enough to fit the 6 GiB heuristic
+			// estimate, so placement succeeds and we reach LoadModel.
+			// LoadModel returns an error, triggering bumpEstimateOnLoadFailure.
+			// Expected bump: 6 GiB + 6 GiB/2 = 9 GiB.
+			const GiB4 = uint64(1) << 30
+			node := &BackendNode{ID: "n", Name: "noctis", Status: StatusHealthy, NodeType: NodeTypeBackend}
+			f := &fakeModelRouter{
+				findAndLockErr: errors.New("not found"),
+				candidateNodes: []BackendNode{*node},
+				nodeGPUs: []NodeGPU{
+					{NodeID: "n", GPUIndex: 0, FreeVRAM: 12 * GiB4},
+				},
+				// Heuristic estimate of 6 GiB drives placement.
+				vramEstimate: &ModelVRAMEstimate{ModelName: "m", VRAMBytes: 6 * GiB4, Source: "heuristic", GPUCountObserved: 1},
+			}
+			unloader := &fakeUnloader{
+				installReply: &messaging.BackendInstallReply{Success: true, Address: "10.0.0.1:9001"},
+			}
+			// LoadModel fails: simulates an OOM or backend rejection.
+			failClient := &stubBackend{loadErr: errors.New("worker OOM")}
+			router := NewSmartRouter(f, SmartRouterOptions{
+				Unloader:      unloader,
+				ClientFactory: &stubClientFactory{client: failClient},
+			})
+
+			_, err := router.scheduleAndLoad(context.Background(), "diffusers", "m", "m",
+				&pb.ModelOptions{Model: "m"}, false, 1)
+			Expect(err).To(HaveOccurred(), "load failure must propagate as an error")
+
+			// The bump is synchronous (called before return), so no Eventually needed.
+			f.mu.Lock()
+			upsert := f.lastHeuristicUpsert
+			f.mu.Unlock()
+			Expect(upsert).ToNot(BeNil(), "bumpEstimateOnLoadFailure must have written a heuristic upsert")
+			Expect(upsert.VRAMBytes).To(Equal(9*GiB4), "expected 6 GiB * 1.5 = 9 GiB bumped estimate")
 		})
 	})
 
@@ -836,6 +1154,51 @@ var _ = Describe("SmartRouter", func() {
 	})
 
 	// -----------------------------------------------------------------------
+	// estimateModelVRAM unit tests (mock-based)
+	// -----------------------------------------------------------------------
+	Describe("estimateModelVRAM", func() {
+		It("returns the cached measured estimate when present in the registry", func() {
+			reg := &fakeModelRouter{
+				vramEstimate: &ModelVRAMEstimate{
+					ModelName: "m",
+					VRAMBytes: 7_000_000_000,
+					Source:    "measured",
+				},
+			}
+			router := NewSmartRouter(reg, SmartRouterOptions{})
+
+			got := router.estimateModelVRAM(context.Background(), "m", &pb.ModelOptions{Model: "m"})
+			Expect(got).To(Equal(uint64(7_000_000_000)))
+		})
+
+		It("looks up the cache by model ID, not model file name (regression: name != file)", func() {
+			// Bug: cache was keyed by opts.Model (the file name, e.g. "Model-File.gguf")
+			// but measured writes used the tracking key ("model-id"). This caused the
+			// measured-wins path to silently never fire when config name != config Model.
+			reg := &fakeModelRouter{
+				vramEstimate: &ModelVRAMEstimate{
+					ModelName: "model-id",
+					VRAMBytes: 7 << 30,
+					Source:    "measured",
+				},
+			}
+			router := NewSmartRouter(reg, SmartRouterOptions{})
+
+			got := router.estimateModelVRAM(context.Background(), "model-id", &pb.ModelOptions{Model: "Model-File.gguf"})
+			Expect(got).To(Equal(uint64(7<<30)), "must return the measured estimate keyed by model ID")
+
+			// Assert the key that reached GetModelVRAMEstimate was the model ID,
+			// not the file name. Without this pin, the test passes even against
+			// the buggy code (fake ignores the name and returns vramEstimate).
+			reg.mu.Lock()
+			capturedKey := reg.lastEstimateKey
+			reg.mu.Unlock()
+			Expect(capturedKey).To(Equal("model-id"),
+				"cache lookup must use the tracking key (model ID), not the model file name")
+		})
+	})
+
+	// -----------------------------------------------------------------------
 	// Integration tests using real PostgreSQL (existing)
 	// -----------------------------------------------------------------------
 	Describe("evictLRUAndFreeNode (integration)", func() {
@@ -863,7 +1226,7 @@ var _ = Describe("SmartRouter", func() {
 			Expect(registry.Register(context.Background(), node, true)).To(Succeed())
 
 			// Load a model and give it in-flight requests so it cannot be evicted
-			Expect(registry.SetNodeModel(context.Background(), node.ID, "busy-model", 0, "loaded", "", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node.ID, "busy-model", 0, "loaded", "", 0, "")).To(Succeed())
 			Expect(registry.IncrementInFlight(context.Background(), node.ID, "busy-model", 0)).To(Succeed())
 
 			router := NewSmartRouter(registry, SmartRouterOptions{DB: db})
@@ -884,7 +1247,7 @@ var _ = Describe("SmartRouter", func() {
 				Address:  "10.0.0.101:50051",
 			}
 			Expect(registry.Register(context.Background(), node, true)).To(Succeed())
-			Expect(registry.SetNodeModel(context.Background(), node.ID, "cancel-model", 0, "loaded", "", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node.ID, "cancel-model", 0, "loaded", "", 0, "")).To(Succeed())
 			Expect(registry.IncrementInFlight(context.Background(), node.ID, "cancel-model", 0)).To(Succeed())
 
 			router := NewSmartRouter(registry, SmartRouterOptions{DB: db})
@@ -1116,7 +1479,7 @@ var _ = Describe("SmartRouter", func() {
 			done := make(chan error, 5)
 			for i := 0; i < 5; i++ {
 				go func() {
-					_, err := router.installBackendOnNode(context.Background(), node, "llama-cpp", "my-model", 0)
+					_, err := router.installBackendOnNode(context.Background(), node, "llama-cpp", "my-model", 0, nil)
 					done <- err
 				}()
 			}
@@ -1146,9 +1509,9 @@ var _ = Describe("SmartRouter", func() {
 				ClientFactory: &stubClientFactory{client: &stubBackend{}},
 			})
 
-			_, err1 := router.installBackendOnNode(context.Background(), node, "llama-cpp", "model-A", 0)
-			_, err2 := router.installBackendOnNode(context.Background(), node, "llama-cpp", "model-B", 0)
-			_, err3 := router.installBackendOnNode(context.Background(), node, "llama-cpp", "model-A", 1)
+			_, err1 := router.installBackendOnNode(context.Background(), node, "llama-cpp", "model-A", 0, nil)
+			_, err2 := router.installBackendOnNode(context.Background(), node, "llama-cpp", "model-B", 0, nil)
+			_, err3 := router.installBackendOnNode(context.Background(), node, "llama-cpp", "model-A", 1, nil)
 			Expect(err1).ToNot(HaveOccurred())
 			Expect(err2).ToNot(HaveOccurred())
 			Expect(err3).ToNot(HaveOccurred())

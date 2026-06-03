@@ -126,14 +126,43 @@ func (ml *ModelLoader) GetGRPCPID(id string) (int, error) {
 	return strconv.Atoi(p.Process().PID)
 }
 
+// overrideEnv returns base with any entries whose key appears in overrides
+// removed, then overrides appended — so child processes see the override value
+// (glibc getenv returns the first match, so a plain append would not override).
+func overrideEnv(base, overrides []string) []string {
+	if len(overrides) == 0 {
+		return base
+	}
+	keys := make(map[string]bool, len(overrides))
+	for _, o := range overrides {
+		if k, _, ok := strings.Cut(o, "="); ok {
+			keys[k] = true
+		}
+	}
+	out := make([]string, 0, len(base)+len(overrides))
+	for _, e := range base {
+		if k, _, ok := strings.Cut(e, "="); ok && keys[k] {
+			continue
+		}
+		out = append(out, e)
+	}
+	return append(out, overrides...)
+}
+
 // StartProcess starts a gRPC backend process and returns its process handle.
 // This is the public wrapper for the internal startProcess method, used by
 // the serve-backend CLI subcommand to start a backend on a specified address.
 func (ml *ModelLoader) StartProcess(grpcProcess, id string, serverAddress string, args ...string) (*process.Process, error) {
-	return ml.startProcess(grpcProcess, id, serverAddress, args...)
+	return ml.startProcess(grpcProcess, id, serverAddress, nil, args...)
 }
 
-func (ml *ModelLoader) startProcess(grpcProcess, id string, serverAddress string, args ...string) (*process.Process, error) {
+// StartProcessWithEnv is StartProcess plus extra environment entries that
+// OVERRIDE the inherited environment (used to pin CUDA_VISIBLE_DEVICES per backend).
+func (ml *ModelLoader) StartProcessWithEnv(grpcProcess, id, serverAddress string, extraEnv []string, args ...string) (*process.Process, error) {
+	return ml.startProcess(grpcProcess, id, serverAddress, extraEnv, args...)
+}
+
+func (ml *ModelLoader) startProcess(grpcProcess, id string, serverAddress string, extraEnv []string, args ...string) (*process.Process, error) {
 	// Make sure the process is executable
 	// Check first if it has executable permissions
 	if fi, err := os.Stat(grpcProcess); err == nil {
@@ -158,7 +187,7 @@ func (ml *ModelLoader) startProcess(grpcProcess, id string, serverAddress string
 		process.WithTemporaryStateDir(),
 		process.WithName(filepath.Base(grpcProcess)),
 		process.WithArgs(append(args, []string{"--addr", serverAddress}...)...),
-		process.WithEnvironment(os.Environ()...),
+		process.WithEnvironment(overrideEnv(os.Environ(), extraEnv)...),
 		process.WithWorkDir(workDir),
 	)
 

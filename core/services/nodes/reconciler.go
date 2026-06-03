@@ -242,7 +242,7 @@ func (rc *ReplicaReconciler) drainPendingBackendOps(ctx context.Context) {
 			// Pending-op drain for admin install — not a per-replica load.
 			// Replica 0 is the conventional admin slot. Install is idempotent:
 			// the worker short-circuits if the backend is already running.
-			reply, err := rc.adapter.InstallBackend(op.NodeID, op.Backend, "", string(op.Galleries), "", "", "", 0, "", nil)
+			reply, err := rc.adapter.InstallBackend(op.NodeID, op.Backend, "", string(op.Galleries), "", "", "", 0, nil, "", nil)
 			if err != nil {
 				applyErr = err
 			} else if !reply.Success {
