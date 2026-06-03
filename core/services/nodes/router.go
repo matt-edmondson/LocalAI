@@ -190,6 +190,12 @@ func (r *SmartRouter) scheduleAndLoad(ctx context.Context, backendType, tracking
 			return nil, fmt.Errorf("staging model files for node %s: %w", node.Name, err)
 		}
 		loadOpts = staged
+	} else if modelOpts != nil {
+		// Clone so applyGPUSet below can never mutate the caller's modelOpts —
+		// proto.Marshal(modelOpts) later stores the PRE-placement blob in
+		// ModelLoadInfo, and a baked-in TensorParallelSize/TensorSplit would
+		// poison reconciler-driven re-loads onto nodes with fewer GPUs.
+		loadOpts = proto.Clone(modelOpts).(*pb.ModelOptions)
 	}
 
 	// Set the multi-GPU knob to match the assigned GPU-set size. The worker's
