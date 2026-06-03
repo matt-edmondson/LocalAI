@@ -284,6 +284,74 @@ func (r *SmartRouter) bumpEstimateOnLoadFailure(ctx context.Context, modelName, 
 	}
 }
 
+// abandonedCleanupTimeout bounds the registry calls made while cleaning up
+// an abandoned load (the acked stop carries its own 30s NATS deadline).
+const abandonedCleanupTimeout = 45 * time.Second
+
+// cleanupAbandonedLoad kills the worker-side backend process for a load that
+// was abandoned after the process was spawned — staging failure, LoadModel
+// timeout / caller disconnect / transport error, or backend-reported failure
+// — and rolls back the per-GPU soft reservations. Without this the worker
+// keeps loading: it completes invisibly, holds RAM/VRAM with no NodeModel
+// row, and both the stale-replica reaper and per-GPU accounting are blind to
+// it (2026-06-03 incident: OOMKilled worker + 7.1GB orphan on GPU0).
+//
+// Runs on a fresh context: the request ctx is typically already cancelled
+// (timeout / disconnect) — that is the point. The stop is synchronous
+// (acked): Route holds the model-load advisory lock through this call, so a
+// queued request for the same model cannot re-install until the process is
+// confirmed dead. Best-effort throughout: failures are logged, never
+// propagated — the load error already on its way to the caller stays the
+// authoritative outcome.
+func (r *SmartRouter) cleanupAbandonedLoad(p *placement, trackingKey string) {
+	ctx, cancel := context.WithTimeout(context.Background(), abandonedCleanupTimeout)
+	defer cancel()
+
+	processKey := fmt.Sprintf("%s#%d", trackingKey, p.replicaIndex)
+
+	// Coalescing guard: the reconciler's ScheduleAndLoadModel runs without
+	// the advisory lock, so a racing load of the same (node, model, replica)
+	// may have already succeeded and registered. Killing now would take down
+	// a live replica — skip the kill, keep the reservation rollback.
+	kill := true
+	if stats, err := r.registry.LoadedReplicaStats(ctx, trackingKey, []string{p.node.ID}); err == nil {
+		for _, s := range stats {
+			if s.NodeID == p.node.ID && s.ReplicaIndex == p.replicaIndex {
+				kill = false
+				break
+			}
+		}
+	}
+
+	switch {
+	case !kill:
+		xlog.Info("Abandoned-load cleanup: replica registered as loaded by a concurrent request, skipping kill",
+			"node", p.node.Name, "processKey", processKey)
+	case r.unloader == nil:
+		// Non-distributed configuration — nothing to send the stop through.
+	default:
+		xlog.Info("Abandoned-load cleanup: stopping worker-side backend process",
+			"node", p.node.Name, "processKey", processKey)
+		if err := r.unloader.StopBackendAndWait(p.node.ID, processKey); err != nil {
+			// Old workers execute the stop but never ack (timeout); real
+			// failures surface on the next placement attempt anyway.
+			xlog.Warn("Abandoned-load cleanup: stop not acked",
+				"node", p.node.Name, "processKey", processKey, "error", err)
+		}
+	}
+
+	// Roll back the per-GPU soft reservations. Underflow-guarded in the
+	// registry and reset by the worker's next heartbeat regardless, so this
+	// only matters for failures inside the first heartbeat window — but it
+	// keeps the columns accurate, symmetric with the install-failure rollback.
+	for _, gi := range p.reservedGPUs {
+		if err := r.registry.ReleaseVRAMOnGPU(ctx, p.node.ID, gi, p.perGPUReserve); err != nil {
+			xlog.Debug("Abandoned-load cleanup: reservation release failed",
+				"node", p.node.ID, "gpu", gi, "bytes", p.perGPUReserve, "error", err)
+		}
+	}
+}
+
 // scheduleAndLoad is the shared core for loading a model on a new node.
 // Used by both Route() (for first-time loads) and ScheduleAndLoadModel() (for reconciler scale-ups).
 //
@@ -299,6 +367,19 @@ func (r *SmartRouter) scheduleAndLoad(ctx context.Context, backendType, tracking
 		return nil, fmt.Errorf("no available nodes: %w", err)
 	}
 	node, backendAddr, replicaIndex, gpuSet := p.node, p.addr, p.replicaIndex, p.gpuSet
+
+	// The worker-side process exists from here on (installBackendOnNode ran
+	// inside scheduleNewModel). If the load is abandoned on any failure path
+	// below — staging error, LoadModel timeout/disconnect/error, or
+	// backend-reported failure — kill that process and roll back the
+	// reservations; otherwise it keeps loading invisibly with no registry
+	// row (2026-06-03 incident).
+	committed := false
+	defer func() {
+		if !committed {
+			r.cleanupAbandonedLoad(p, trackingKey)
+		}
+	}()
 
 	// Task 4.1: capture pre-load free VRAM snapshot and track this in-flight load
 	// for clean attribution of the post-load delta.
@@ -363,6 +444,10 @@ func (r *SmartRouter) scheduleAndLoad(ctx context.Context, backendType, tracking
 			return nil, fmt.Errorf("loading model %s on node %s: %s", modelName, node.Name, res.Message)
 		}
 	}
+
+	// Load committed: every path past here leaves a live, registered (or at
+	// worst registry-lagging) replica that the normal unload paths own.
+	committed = true
 
 	// Record the model as loaded on this node (specific replica slot), stamping
 	// the assigned physical GPU indices so observability and reconciliation can

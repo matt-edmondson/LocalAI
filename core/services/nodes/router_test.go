@@ -159,6 +159,14 @@ type fakeModelRouter struct {
 	// lastEstimateKey captures the model name argument passed to the most
 	// recent GetModelVRAMEstimate call. Protected by mu.
 	lastEstimateKey string
+
+	// nextFreeReplica is returned by NextFreeReplicaIndex (default 0).
+	nextFreeReplica int
+
+	// reserveGPUCalls / releaseGPUCalls record per-GPU soft reservation
+	// traffic as "nodeID:gpuIndex:bytes" for cleanup assertions.
+	reserveGPUCalls []string
+	releaseGPUCalls []string
 }
 
 func (f *fakeModelRouter) FindAndLockNodeWithModel(_ context.Context, modelName string, _ []string, pref *RoutePreference) (*BackendNode, *NodeModel, error) {
@@ -218,7 +226,7 @@ func (f *fakeModelRouter) GetModelLoadInfo(_ context.Context, _ string) (string,
 }
 
 func (f *fakeModelRouter) NextFreeReplicaIndex(_ context.Context, _, _ string, _ int) (int, error) {
-	return 0, nil
+	return f.nextFreeReplica, nil
 }
 
 func (f *fakeModelRouter) CountReplicasOnNode(_ context.Context, _, _ string) (int, error) {
@@ -340,11 +348,17 @@ func (f *fakeModelRouter) NodeGPUs(_ context.Context, _ string) ([]NodeGPU, erro
 	return f.nodeGPUs, f.nodeGPUsErr
 }
 
-func (f *fakeModelRouter) ReserveVRAMOnGPU(_ context.Context, _ string, _ int, _ uint64) error {
+func (f *fakeModelRouter) ReserveVRAMOnGPU(_ context.Context, nodeID string, gpuIndex int, bytes uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reserveGPUCalls = append(f.reserveGPUCalls, fmt.Sprintf("%s:%d:%d", nodeID, gpuIndex, bytes))
 	return nil
 }
 
-func (f *fakeModelRouter) ReleaseVRAMOnGPU(_ context.Context, _ string, _ int, _ uint64) error {
+func (f *fakeModelRouter) ReleaseVRAMOnGPU(_ context.Context, nodeID string, gpuIndex int, bytes uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releaseGPUCalls = append(f.releaseGPUCalls, fmt.Sprintf("%s:%d:%d", nodeID, gpuIndex, bytes))
 	return nil
 }
 
