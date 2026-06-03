@@ -747,10 +747,10 @@ var _ = Describe("SmartRouter", func() {
 				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
 			})
 
-			gotNode, _, _, gpuSet, err := router.scheduleNewModel(context.Background(), "diffusers", "m", &pb.ModelOptions{Model: "m"})
+			p, err := router.scheduleNewModel(context.Background(), "diffusers", "m", &pb.ModelOptions{Model: "m"})
 			Expect(err).ToNot(HaveOccurred())
-			Expect(gotNode.ID).To(Equal("n"))
-			Expect(gpuSet).To(Equal([]int{1}))
+			Expect(p.node.ID).To(Equal("n"))
+			Expect(p.gpuSet).To(Equal([]int{1}))
 			// The pinned index must reach the worker via backend.install.
 			Expect(unloader.lastInstallGPUIndices).To(Equal([]int{1}))
 		})
@@ -777,7 +777,7 @@ var _ = Describe("SmartRouter", func() {
 				// DB intentionally nil: evictLRUAndFreeNode returns ErrEvictionBusy.
 			})
 
-			_, _, _, _, err := router.scheduleNewModel(context.Background(), "diffusers", "big", &pb.ModelOptions{Model: "big"})
+			_, err := router.scheduleNewModel(context.Background(), "diffusers", "big", &pb.ModelOptions{Model: "big"})
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("more VRAM than any GPU set"))
 		})
@@ -804,10 +804,10 @@ var _ = Describe("SmartRouter", func() {
 				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
 			})
 
-			gotNode, _, _, gpuSet, err := router.scheduleNewModel(context.Background(), "diffusers", "unknown-size", &pb.ModelOptions{Model: "unknown-size"})
+			p, err := router.scheduleNewModel(context.Background(), "diffusers", "unknown-size", &pb.ModelOptions{Model: "unknown-size"})
 			Expect(err).ToNot(HaveOccurred())
-			Expect(gotNode.ID).To(Equal("legacy"))
-			Expect(gpuSet).To(BeEmpty(), "legacy fallback must not pin a GPU (no estimate available)")
+			Expect(p.node.ID).To(Equal("legacy"))
+			Expect(p.gpuSet).To(BeEmpty(), "legacy fallback must not pin a GPU (no estimate available)")
 		})
 
 		// Task 4.1: after a successful load, the VRAM footprint is measured and cached.
@@ -895,11 +895,11 @@ var _ = Describe("SmartRouter", func() {
 				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
 			})
 
-			gotNode, _, _, gpuSet, err := router.scheduleNewModel(context.Background(), "diffusers", "big-diffuser", &pb.ModelOptions{Model: "big-diffuser"})
+			p, err := router.scheduleNewModel(context.Background(), "diffusers", "big-diffuser", &pb.ModelOptions{Model: "big-diffuser"})
 			Expect(err).ToNot(HaveOccurred())
-			Expect(gotNode.ID).To(Equal("noctis"))
+			Expect(p.node.ID).To(Equal("noctis"))
 			// Both GPUs must be selected (sorted ascending: [0,1]).
-			Expect(gpuSet).To(Equal([]int{0, 1}))
+			Expect(p.gpuSet).To(Equal([]int{0, 1}))
 			// The pinned indices must reach the worker via backend.install.
 			Expect(unloader.lastInstallGPUIndices).To(Equal([]int{0, 1}))
 
@@ -907,7 +907,7 @@ var _ = Describe("SmartRouter", func() {
 			// (applyGPUSet is called in the load path on a cloned ModelOptions, not inside
 			// scheduleNewModel itself; we unit-assert it here to pin the TensorSplit behaviour.)
 			splitOpts := &pb.ModelOptions{}
-			applyGPUSet(splitOpts, len(gpuSet))
+			applyGPUSet(splitOpts, len(p.gpuSet))
 			Expect(splitOpts.TensorParallelSize).To(Equal(int32(2)))
 			Expect(splitOpts.TensorSplit).To(Equal("1,1"))
 		})
