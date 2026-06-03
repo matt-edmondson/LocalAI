@@ -636,12 +636,21 @@ func (r *NodeRegistry) Deregister(ctx context.Context, nodeID string) error {
 	return nil
 }
 
+// GPUHeartbeat is one GPU's VRAM reading in a heartbeat payload.
+type GPUHeartbeat struct {
+	Index     int    `json:"index"`
+	TotalVRAM uint64 `json:"total_vram"`
+	FreeVRAM  uint64 `json:"free_vram"`
+	UsedVRAM  uint64 `json:"used_vram"`
+}
+
 // HeartbeatUpdate contains optional fields to update on heartbeat.
 type HeartbeatUpdate struct {
-	AvailableVRAM *uint64 `json:"available_vram,omitempty"`
-	TotalVRAM     *uint64 `json:"total_vram,omitempty"`
-	AvailableRAM  *uint64 `json:"available_ram,omitempty"`
-	GPUVendor     string  `json:"gpu_vendor,omitempty"`
+	AvailableVRAM *uint64        `json:"available_vram,omitempty"`
+	TotalVRAM     *uint64        `json:"total_vram,omitempty"`
+	AvailableRAM  *uint64        `json:"available_ram,omitempty"`
+	GPUVendor     string         `json:"gpu_vendor,omitempty"`
+	GPUs          []GPUHeartbeat `json:"gpus,omitempty"`
 }
 
 // Heartbeat updates the heartbeat timestamp and status for a node.
@@ -689,6 +698,19 @@ func (r *NodeRegistry) Heartbeat(ctx context.Context, nodeID string, update *Hea
 		}
 		if result.RowsAffected == 0 {
 			return fmt.Errorf("node %s not found", nodeID)
+		}
+	}
+	if update != nil && len(update.GPUs) > 0 {
+		for _, g := range update.GPUs {
+			// Worker is source of truth: refresh free/total and clear the
+			// in-tick reservation. ON CONFLICT updates the existing row.
+			row := NodeGPU{NodeID: nodeID, GPUIndex: g.Index, TotalVRAM: g.TotalVRAM, FreeVRAM: g.FreeVRAM, ReservedVRAM: 0, UpdatedAt: time.Now()}
+			if err := db.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "node_id"}, {Name: "gpu_index"}},
+				DoUpdates: clause.AssignmentColumns([]string{"total_vram", "free_vram", "reserved_vram", "updated_at"}),
+			}).Create(&row).Error; err != nil {
+				xlog.Warn("Failed to upsert node GPU", "node", nodeID, "gpu", g.Index, "error", err)
+			}
 		}
 	}
 	return nil

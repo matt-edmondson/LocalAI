@@ -335,7 +335,7 @@ func HeartbeatEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
 		_ = c.Bind(&update) // best-effort — empty body is fine
 
 		var updatePtr *nodes.HeartbeatUpdate
-		if update.AvailableVRAM != nil || update.TotalVRAM != nil || update.AvailableRAM != nil || update.GPUVendor != "" {
+		if update.AvailableVRAM != nil || update.TotalVRAM != nil || update.AvailableRAM != nil || update.GPUVendor != "" || len(update.GPUs) > 0 {
 			updatePtr = &update
 		}
 

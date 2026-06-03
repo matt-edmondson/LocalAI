@@ -1502,6 +1502,27 @@ var _ = Describe("NodeRegistry", func() {
 		})
 	})
 
+	Describe("heartbeat per-GPU upsert", func() {
+		It("upserts node_gpus rows and clears their reservation", func() {
+			node := makeNode("hb-node", "10.0.0.9:50051", uint64(24e9))
+			Expect(registry.Register(context.Background(), node, true)).To(Succeed())
+			Expect(db.Create(&NodeGPU{NodeID: node.ID, GPUIndex: 0, TotalVRAM: uint64(12e9), FreeVRAM: uint64(1e9), ReservedVRAM: uint64(5e9)}).Error).To(Succeed())
+
+			gpus := []GPUHeartbeat{
+				{Index: 0, TotalVRAM: uint64(12e9), FreeVRAM: uint64(9e9), UsedVRAM: uint64(3e9)},
+				{Index: 1, TotalVRAM: uint64(12e9), FreeVRAM: uint64(12e9), UsedVRAM: 0},
+			}
+			Expect(registry.Heartbeat(context.Background(), node.ID, &HeartbeatUpdate{GPUs: gpus})).To(Succeed())
+
+			got, err := registry.NodeGPUs(context.Background(), node.ID)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(got).To(HaveLen(2))
+			Expect(got[0].FreeVRAM).To(Equal(uint64(9e9)))
+			Expect(got[0].ReservedVRAM).To(Equal(uint64(0)), "fresh heartbeat clears the soft reservation")
+			Expect(got[1].FreeVRAM).To(Equal(uint64(12e9)))
+		})
+	})
+
 	Describe("per-GPU reservation", func() {
 		BeforeEach(func() {
 			Expect(db.Create(&NodeGPU{NodeID: "n", GPUIndex: 0, TotalVRAM: uint64(12e9), FreeVRAM: uint64(12e9)}).Error).To(Succeed())
