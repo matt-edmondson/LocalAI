@@ -366,7 +366,7 @@ type upgradeCall struct {
 	replica int
 }
 
-func (f *fakeUnloader) InstallBackend(nodeID, backend, modelID, _, _, _, _ string, replica int, _ string, _ func(messaging.BackendInstallProgressEvent)) (*messaging.BackendInstallReply, error) {
+func (f *fakeUnloader) InstallBackend(nodeID, backend, modelID, _, _, _, _ string, replica int, _ []int, _ string, _ func(messaging.BackendInstallProgressEvent)) (*messaging.BackendInstallReply, error) {
 	// installHook intentionally runs OUTSIDE the mutex: the hook may block
 	// on a channel and we don't want to serialize concurrent callers,
 	// which would defeat the singleflight-overlap test.
@@ -1149,7 +1149,7 @@ var _ = Describe("SmartRouter", func() {
 			done := make(chan error, 5)
 			for i := 0; i < 5; i++ {
 				go func() {
-					_, err := router.installBackendOnNode(context.Background(), node, "llama-cpp", "my-model", 0)
+					_, err := router.installBackendOnNode(context.Background(), node, "llama-cpp", "my-model", 0, nil)
 					done <- err
 				}()
 			}
@@ -1179,9 +1179,9 @@ var _ = Describe("SmartRouter", func() {
 				ClientFactory: &stubClientFactory{client: &stubBackend{}},
 			})
 
-			_, err1 := router.installBackendOnNode(context.Background(), node, "llama-cpp", "model-A", 0)
-			_, err2 := router.installBackendOnNode(context.Background(), node, "llama-cpp", "model-B", 0)
-			_, err3 := router.installBackendOnNode(context.Background(), node, "llama-cpp", "model-A", 1)
+			_, err1 := router.installBackendOnNode(context.Background(), node, "llama-cpp", "model-A", 0, nil)
+			_, err2 := router.installBackendOnNode(context.Background(), node, "llama-cpp", "model-B", 0, nil)
+			_, err3 := router.installBackendOnNode(context.Background(), node, "llama-cpp", "model-A", 1, nil)
 			Expect(err1).ToNot(HaveOccurred())
 			Expect(err2).ToNot(HaveOccurred())
 			Expect(err3).ToNot(HaveOccurred())

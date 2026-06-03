@@ -160,6 +160,11 @@ type BackendInstallRequest struct {
 	// running, debounced to roughly 250ms. Empty means the caller is a
 	// reconciler-driven retry that does not need progress streamed.
 	OpID string `json:"op_id,omitempty"`
+	// GPUIndices are the physical GPU indices the scheduler assigned to this
+	// backend. The worker sets CUDA_VISIBLE_DEVICES to these so the process
+	// only sees its assigned cards. Empty means "no pinning" (CPU / single-GPU
+	// legacy behavior).
+	GPUIndices []int `json:"gpu_indices,omitempty"`
 }
 
 // BackendInstallReply is the response from a backend.install NATS request.

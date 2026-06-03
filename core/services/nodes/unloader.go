@@ -34,7 +34,7 @@ type backendStopRequest struct {
 // nats.ErrNoResponders for old workers that don't subscribe to the new
 // backend.upgrade subject.
 type NodeCommandSender interface {
-	InstallBackend(nodeID, backendType, modelID, galleriesJSON, uri, name, alias string, replicaIndex int, opID string, onProgress func(messaging.BackendInstallProgressEvent)) (*messaging.BackendInstallReply, error)
+	InstallBackend(nodeID, backendType, modelID, galleriesJSON, uri, name, alias string, replicaIndex int, gpuIndices []int, opID string, onProgress func(messaging.BackendInstallProgressEvent)) (*messaging.BackendInstallReply, error)
 	UpgradeBackend(nodeID, backendType, galleriesJSON, uri, name, alias string, replicaIndex int) (*messaging.BackendUpgradeReply, error)
 	DeleteBackend(nodeID, backendName string) (*messaging.BackendDeleteReply, error)
 	ListBackends(nodeID string) (*messaging.BackendListReply, error)
@@ -121,6 +121,7 @@ func (a *RemoteUnloaderAdapter) UnloadRemoteModel(modelName string) error {
 func (a *RemoteUnloaderAdapter) InstallBackend(
 	nodeID, backendType, modelID, galleriesJSON, uri, name, alias string,
 	replicaIndex int,
+	gpuIndices []int,
 	opID string,
 	onProgress func(messaging.BackendInstallProgressEvent),
 ) (*messaging.BackendInstallReply, error) {
@@ -169,6 +170,7 @@ func (a *RemoteUnloaderAdapter) InstallBackend(
 		Name:             name,
 		Alias:            alias,
 		ReplicaIndex:     int32(replicaIndex),
+		GPUIndices:       gpuIndices,
 		OpID:             opID,
 	}, a.installTimeout)
 

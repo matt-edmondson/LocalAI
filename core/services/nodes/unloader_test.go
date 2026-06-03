@@ -270,7 +270,7 @@ var _ = Describe("RemoteUnloaderAdapter timeout configuration", func() {
 		mc.scriptReply(messaging.SubjectNodeBackendInstall("n1"), messaging.BackendInstallReply{Success: true, Address: "127.0.0.1:0"})
 		adapter := NewRemoteUnloaderAdapter(nil, mc, 7*time.Minute, 11*time.Minute)
 
-		_, err := adapter.InstallBackend("n1", "llama-cpp", "", "[]", "", "", "", 0, "", nil)
+		_, err := adapter.InstallBackend("n1", "llama-cpp", "", "[]", "", "", "", 0, nil, "", nil)
 		Expect(err).ToNot(HaveOccurred())
 
 		Expect(mc.calls).To(HaveLen(1))
@@ -296,7 +296,7 @@ var _ = Describe("RemoteUnloaderAdapter NATS timeout handling", func() {
 		mc.scriptErr(messaging.SubjectNodeBackendInstall("n1"), nats.ErrTimeout)
 		adapter := NewRemoteUnloaderAdapter(nil, mc, 100*time.Millisecond, 1*time.Second)
 
-		_, err := adapter.InstallBackend("n1", "vllm", "", "[]", "", "", "", 0, "", nil)
+		_, err := adapter.InstallBackend("n1", "vllm", "", "[]", "", "", "", 0, nil, "", nil)
 		Expect(err).To(HaveOccurred())
 		Expect(errors.Is(err, galleryop.ErrWorkerStillInstalling)).To(BeTrue(),
 			"expected wrapped ErrWorkerStillInstalling, got %v", err)
@@ -307,7 +307,7 @@ var _ = Describe("RemoteUnloaderAdapter NATS timeout handling", func() {
 		mc.scriptErr(messaging.SubjectNodeBackendInstall("n1"), nats.ErrNoResponders)
 		adapter := NewRemoteUnloaderAdapter(nil, mc, 100*time.Millisecond, 1*time.Second)
 
-		_, err := adapter.InstallBackend("n1", "vllm", "", "[]", "", "", "", 0, "", nil)
+		_, err := adapter.InstallBackend("n1", "vllm", "", "[]", "", "", "", 0, nil, "", nil)
 		Expect(err).To(HaveOccurred())
 		Expect(errors.Is(err, galleryop.ErrWorkerStillInstalling)).To(BeFalse())
 		Expect(errors.Is(err, nats.ErrNoResponders)).To(BeTrue())
@@ -334,7 +334,7 @@ var _ = Describe("RemoteUnloaderAdapter install progress streaming", func() {
 			received = append(received, ev)
 		}
 
-		_, err := adapter.InstallBackend("n1", "vllm", "", "[]", "", "", "", 0, "op-abc", onProgress)
+		_, err := adapter.InstallBackend("n1", "vllm", "", "[]", "", "", "", 0, nil, "op-abc", onProgress)
 		Expect(err).ToNot(HaveOccurred())
 
 		Eventually(func() int {
@@ -349,7 +349,7 @@ var _ = Describe("RemoteUnloaderAdapter install progress streaming", func() {
 		mc.scriptReply(messaging.SubjectNodeBackendInstall("n1"), messaging.BackendInstallReply{Success: true})
 
 		adapter := NewRemoteUnloaderAdapter(nil, mc, 1*time.Second, 1*time.Second)
-		_, err := adapter.InstallBackend("n1", "vllm", "", "[]", "", "", "", 0, "", nil)
+		_, err := adapter.InstallBackend("n1", "vllm", "", "[]", "", "", "", 0, nil, "", nil)
 		Expect(err).ToNot(HaveOccurred())
 
 		Expect(mc.subscribeCalls()).To(BeEmpty(),

@@ -889,7 +889,7 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 
 	// Send backend.install — the worker installs the backend if needed and
 	// starts the gRPC process bound to a port for this (model, replica) slot.
-	addr, installErr := r.installBackendOnNode(ctx, node, backendType, modelID, replicaIdx)
+	addr, installErr := r.installBackendOnNode(ctx, node, backendType, modelID, replicaIdx, nil)
 	if installErr != nil {
 		// Roll back the reservation explicitly so the column is accurate
 		// before the next heartbeat. Best-effort.
@@ -972,14 +972,14 @@ func (r *SmartRouter) estimateModelVRAM(ctx context.Context, opts *pb.ModelOptio
 // Routine load: the worker's fast-path "already running → return current
 // address" is correct here. Upgrades go through
 // DistributedBackendManager.UpgradeBackend on the backend.upgrade subject.
-func (r *SmartRouter) installBackendOnNode(ctx context.Context, node *BackendNode, backendType, modelID string, replicaIndex int) (string, error) {
+func (r *SmartRouter) installBackendOnNode(ctx context.Context, node *BackendNode, backendType, modelID string, replicaIndex int, gpuIndices []int) (string, error) {
 	if r.unloader == nil {
 		return "", fmt.Errorf("no NATS connection for backend installation")
 	}
 
-	key := fmt.Sprintf("%s|%s|%s|%d", node.ID, backendType, modelID, replicaIndex)
+	key := fmt.Sprintf("%s|%s|%s|%d|%v", node.ID, backendType, modelID, replicaIndex, gpuIndices)
 	v, err, _ := r.installFlight.Do(key, func() (any, error) {
-		reply, err := r.unloader.InstallBackend(node.ID, backendType, modelID, r.galleriesJSON, "", "", "", replicaIndex, "", nil)
+		reply, err := r.unloader.InstallBackend(node.ID, backendType, modelID, r.galleriesJSON, "", "", "", replicaIndex, gpuIndices, "", nil)
 		if err != nil {
 			return "", err
 		}
