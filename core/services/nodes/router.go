@@ -244,6 +244,24 @@ func (r *SmartRouter) recordMeasuredVRAM(ctx context.Context, nodeID, modelName,
 	xlog.Debug("measured VRAM not cleanly attributable; keeping heuristic", "model", modelName, "node", nodeID)
 }
 
+// bumpEstimateOnLoadFailure raises the cached VRAM estimate for a model whose
+// load just failed, so the next placement reserves/spans more instead of
+// retrying into the same wall. Heuristic-sourced only: UpsertModelVRAMEstimate
+// refuses to overwrite a measured row, which is intended — when an accurately
+// measured model fails to load, size was not the problem.
+func (r *SmartRouter) bumpEstimateOnLoadFailure(ctx context.Context, modelName, backend string) {
+	cached, err := r.registry.GetModelVRAMEstimate(ctx, modelName)
+	if err != nil || cached == nil || cached.VRAMBytes == 0 {
+		return
+	}
+	bumped := cached.VRAMBytes + cached.VRAMBytes/2 // ×1.5 without float
+	if upErr := r.registry.UpsertModelVRAMEstimate(ctx, modelName, backend, bumped, "heuristic", cached.GPUCountObserved); upErr != nil {
+		xlog.Debug("failed to bump VRAM estimate after load failure", "model", modelName, "error", upErr)
+	} else {
+		xlog.Info("Bumped VRAM estimate after load failure", "model", modelName, "from", cached.VRAMBytes, "to", bumped)
+	}
+}
+
 // scheduleAndLoad is the shared core for loading a model on a new node.
 // Used by both Route() (for first-time loads) and ScheduleAndLoadModel() (for reconciler scale-ups).
 //
@@ -314,9 +332,11 @@ func (r *SmartRouter) scheduleAndLoad(ctx context.Context, backendType, tracking
 
 		res, err := client.LoadModel(loadCtx, loadOpts)
 		if err != nil {
+			r.bumpEstimateOnLoadFailure(ctx, trackingKey, backendType)
 			return nil, fmt.Errorf("loading model %s on node %s: %w", modelName, node.Name, err)
 		}
 		if !res.Success {
+			r.bumpEstimateOnLoadFailure(ctx, trackingKey, backendType)
 			return nil, fmt.Errorf("loading model %s on node %s: %s", modelName, node.Name, res.Message)
 		}
 	}

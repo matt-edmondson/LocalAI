@@ -151,6 +151,10 @@ type fakeModelRouter struct {
 	// lastUpsert captures the most recent UpsertModelVRAMEstimate call with
 	// source=="measured". Protected by mu.
 	lastUpsert *ModelVRAMEstimate
+
+	// lastHeuristicUpsert captures the most recent UpsertModelVRAMEstimate call
+	// with source=="heuristic". Protected by mu.
+	lastHeuristicUpsert *ModelVRAMEstimate
 }
 
 func (f *fakeModelRouter) FindAndLockNodeWithModel(_ context.Context, modelName string, _ []string, pref *RoutePreference) (*BackendNode, *NodeModel, error) {
@@ -294,16 +298,20 @@ func (f *fakeModelRouter) GetModelVRAMEstimate(_ context.Context, _ string) (*Mo
 }
 
 func (f *fakeModelRouter) UpsertModelVRAMEstimate(_ context.Context, modelName, backend string, bytes uint64, source string, gpuCount int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	est := &ModelVRAMEstimate{
+		ModelName:        modelName,
+		Backend:          backend,
+		VRAMBytes:        bytes,
+		Source:           source,
+		GPUCountObserved: gpuCount,
+	}
 	if source == "measured" {
-		f.mu.Lock()
-		f.lastUpsert = &ModelVRAMEstimate{
-			ModelName:        modelName,
-			Backend:          backend,
-			VRAMBytes:        bytes,
-			Source:           source,
-			GPUCountObserved: gpuCount,
-		}
-		f.mu.Unlock()
+		f.lastUpsert = est
+	}
+	if source == "heuristic" {
+		f.lastHeuristicUpsert = est
 	}
 	return nil
 }
@@ -845,6 +853,45 @@ var _ = Describe("SmartRouter", func() {
 			f.mu.Unlock()
 			Expect(upsert.Source).To(Equal("measured"))
 			Expect(upsert.VRAMBytes).To(Equal(8*GiB2), "expected 12 GiB - 4 GiB = 8 GiB footprint")
+		})
+
+		// Task 4.2: on load failure, bump the heuristic VRAM estimate ×1.5.
+		It("bumps the cached heuristic VRAM estimate ×1.5 after a load failure (Task 4.2)", func() {
+			// Node has one GPU with 12 GiB free — enough to fit the 6 GiB heuristic
+			// estimate, so placement succeeds and we reach LoadModel.
+			// LoadModel returns an error, triggering bumpEstimateOnLoadFailure.
+			// Expected bump: 6 GiB + 6 GiB/2 = 9 GiB.
+			const GiB4 = uint64(1) << 30
+			node := &BackendNode{ID: "n", Name: "noctis", Status: StatusHealthy, NodeType: NodeTypeBackend}
+			f := &fakeModelRouter{
+				findAndLockErr: errors.New("not found"),
+				candidateNodes: []BackendNode{*node},
+				nodeGPUs: []NodeGPU{
+					{NodeID: "n", GPUIndex: 0, FreeVRAM: 12 * GiB4},
+				},
+				// Heuristic estimate of 6 GiB drives placement.
+				vramEstimate: &ModelVRAMEstimate{ModelName: "m", VRAMBytes: 6 * GiB4, Source: "heuristic", GPUCountObserved: 1},
+			}
+			unloader := &fakeUnloader{
+				installReply: &messaging.BackendInstallReply{Success: true, Address: "10.0.0.1:9001"},
+			}
+			// LoadModel fails: simulates an OOM or backend rejection.
+			failClient := &stubBackend{loadErr: errors.New("worker OOM")}
+			router := NewSmartRouter(f, SmartRouterOptions{
+				Unloader:      unloader,
+				ClientFactory: &stubClientFactory{client: failClient},
+			})
+
+			_, err := router.scheduleAndLoad(context.Background(), "diffusers", "m", "m",
+				&pb.ModelOptions{Model: "m"}, false, 1)
+			Expect(err).To(HaveOccurred(), "load failure must propagate as an error")
+
+			// The bump is synchronous (called before return), so no Eventually needed.
+			f.mu.Lock()
+			upsert := f.lastHeuristicUpsert
+			f.mu.Unlock()
+			Expect(upsert).ToNot(BeNil(), "bumpEstimateOnLoadFailure must have written a heuristic upsert")
+			Expect(upsert.VRAMBytes).To(Equal(9*GiB4), "expected 6 GiB * 1.5 = 9 GiB bumped estimate")
 		})
 	})
 
