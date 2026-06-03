@@ -1546,4 +1546,34 @@ var _ = Describe("NodeRegistry", func() {
 			Expect(gpus[1].GPUIndex).To(Equal(1))
 		})
 	})
+
+	Describe("ModelVRAMEstimate cache", func() {
+		It("upserts and reads back, measured overwrites heuristic", func() {
+			ctx := context.Background()
+			Expect(registry.UpsertModelVRAMEstimate(ctx, "sdxl", "diffusers", uint64(9e9), "heuristic", 1)).To(Succeed())
+			got, err := registry.GetModelVRAMEstimate(ctx, "sdxl")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(got.VRAMBytes).To(Equal(uint64(9e9)))
+			Expect(got.Source).To(Equal("heuristic"))
+
+			Expect(registry.UpsertModelVRAMEstimate(ctx, "sdxl", "diffusers", 7_500_000_000, "measured", 1)).To(Succeed())
+			got, err = registry.GetModelVRAMEstimate(ctx, "sdxl")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(got.VRAMBytes).To(Equal(uint64(7_500_000_000)))
+			Expect(got.Source).To(Equal("measured"))
+		})
+		It("does not let a heuristic overwrite a measured value", func() {
+			ctx := context.Background()
+			Expect(registry.UpsertModelVRAMEstimate(ctx, "m2", "diffusers", uint64(7e9), "measured", 1)).To(Succeed())
+			Expect(registry.UpsertModelVRAMEstimate(ctx, "m2", "diffusers", uint64(12e9), "heuristic", 1)).To(Succeed())
+			got, err := registry.GetModelVRAMEstimate(ctx, "m2")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(got.VRAMBytes).To(Equal(uint64(7e9)), "measured must not be downgraded by a heuristic")
+			Expect(got.Source).To(Equal("measured"))
+		})
+		It("returns gorm.ErrRecordNotFound for an unknown model", func() {
+			_, err := registry.GetModelVRAMEstimate(context.Background(), "nope")
+			Expect(err).To(MatchError(gorm.ErrRecordNotFound))
+		})
+	})
 })

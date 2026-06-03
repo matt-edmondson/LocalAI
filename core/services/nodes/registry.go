@@ -110,6 +110,21 @@ type NodeGPU struct {
 
 func (NodeGPU) TableName() string { return "node_gpus" }
 
+// ModelVRAMEstimate caches the VRAM footprint of a model, keyed by model name.
+// source is "heuristic" (file-size seed) or "measured" (observed after a load).
+// A measured row always overwrites a heuristic one; this drives auto multi-GPU
+// span decisions in the scheduler.
+type ModelVRAMEstimate struct {
+	ModelName        string    `gorm:"primaryKey;size:255" json:"model_name"`
+	Backend          string    `gorm:"size:128" json:"backend"`
+	VRAMBytes        uint64    `gorm:"column:vram_bytes" json:"vram_bytes"`
+	Source           string    `gorm:"size:16" json:"source"`
+	GPUCountObserved int       `gorm:"column:gpu_count_observed;default:1" json:"gpu_count_observed"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+func (ModelVRAMEstimate) TableName() string { return "model_vram_estimates" }
+
 // ModelLoadInfo is per-model load metadata kept independently of NodeModel rows
 // so the Replica Reconciler can re-load a model after every replica row has
 // been removed (worker death, eviction, MarkOffline reaping, frontend restart
@@ -278,7 +293,7 @@ func (r *NodeRegistry) nodeModelNames(ctx context.Context, db *gorm.DB, nodeID s
 // when multiple instances (frontend + workers) start at the same time.
 func NewNodeRegistry(db *gorm.DB) (*NodeRegistry, error) {
 	if err := advisorylock.WithLockCtx(context.Background(), db, advisorylock.KeySchemaMigrate, func() error {
-		return db.AutoMigrate(&BackendNode{}, &NodeModel{}, &NodeLabel{}, &ModelSchedulingConfig{}, &PendingBackendOp{}, &ModelLoadInfo{}, &NodeGPU{})
+		return db.AutoMigrate(&BackendNode{}, &NodeModel{}, &NodeLabel{}, &ModelSchedulingConfig{}, &PendingBackendOp{}, &ModelLoadInfo{}, &NodeGPU{}, &ModelVRAMEstimate{})
 	}); err != nil {
 		return nil, fmt.Errorf("migrating node tables: %w", err)
 	}
@@ -597,6 +612,33 @@ func (r *NodeRegistry) NodeGPUs(ctx context.Context, nodeID string) ([]NodeGPU, 
 	var gpus []NodeGPU
 	err := r.db.WithContext(ctx).Where("node_id = ?", nodeID).Order("gpu_index ASC").Find(&gpus).Error
 	return gpus, err
+}
+
+// GetModelVRAMEstimate returns the cached estimate for a model, or
+// gorm.ErrRecordNotFound if none exists.
+func (r *NodeRegistry) GetModelVRAMEstimate(ctx context.Context, modelName string) (*ModelVRAMEstimate, error) {
+	var e ModelVRAMEstimate
+	if err := r.db.WithContext(ctx).Where("model_name = ?", modelName).First(&e).Error; err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+// UpsertModelVRAMEstimate writes (or overwrites) the cached estimate. A
+// "measured" source always wins over a "heuristic" one; a fresh "heuristic"
+// must NOT clobber an existing "measured" value.
+func (r *NodeRegistry) UpsertModelVRAMEstimate(ctx context.Context, modelName, backend string, bytes uint64, source string, gpuCount int) error {
+	if source == "heuristic" {
+		// Don't downgrade a measured row back to a heuristic seed.
+		if existing, err := r.GetModelVRAMEstimate(ctx, modelName); err == nil && existing.Source == "measured" {
+			return nil
+		}
+	}
+	row := ModelVRAMEstimate{ModelName: modelName, Backend: backend, VRAMBytes: bytes, Source: source, GPUCountObserved: gpuCount, UpdatedAt: time.Now()}
+	return r.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "model_name"}},
+		DoUpdates: clause.AssignmentColumns([]string{"backend", "vram_bytes", "source", "gpu_count_observed", "updated_at"}),
+	}).Create(&row).Error
 }
 
 // Deregister removes a backend node, its model associations, and any auto-provisioned auth credentials.
