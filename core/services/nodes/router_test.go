@@ -415,10 +415,12 @@ type fakeUnloader struct {
 	upgradeErr   error
 	upgradeCalls []upgradeCall // every UpgradeBackend invocation, in order
 
-	stopCalls   []string // "nodeID:model"
-	stopErr     error
-	unloadCalls []string
-	unloadErr   error
+	stopCalls        []string // "nodeID:model"
+	stopErr          error
+	stopAndWaitCalls []string // "nodeID:processKey"
+	stopAndWaitErr   error
+	unloadCalls      []string
+	unloadErr        error
 
 	// lastInstallGPUIndices captures the GPU indices the scheduler pinned on
 	// the most recent InstallBackend call (Task 3.4).
@@ -474,6 +476,13 @@ func (f *fakeUnloader) ListBackends(_ string) (*messaging.BackendListReply, erro
 func (f *fakeUnloader) StopBackend(nodeID, backend string) error {
 	f.stopCalls = append(f.stopCalls, nodeID+":"+backend)
 	return f.stopErr
+}
+
+func (f *fakeUnloader) StopBackendAndWait(nodeID, backend string) error {
+	f.mu.Lock()
+	f.stopAndWaitCalls = append(f.stopAndWaitCalls, nodeID+":"+backend)
+	f.mu.Unlock()
+	return f.stopAndWaitErr
 }
 
 func (f *fakeUnloader) UnloadModelOnNode(nodeID, modelName string) error {
