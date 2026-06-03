@@ -248,6 +248,22 @@ func SubjectNodeBackendStop(nodeID string) string {
 	return subjectNodePrefix + sanitizeSubjectToken(nodeID) + ".backend.stop"
 }
 
+// BackendStopRequest is the payload for a backend.stop NATS message. The
+// same payload serves both delivery modes: fire-and-forget Publish (eviction,
+// admin unload) and request-reply (the frontend's abandoned-load cleanup,
+// which must hold the model-load advisory lock until the process is dead).
+type BackendStopRequest struct {
+	Backend string `json:"backend"`
+}
+
+// BackendStopReply is the worker's ack for a request-reply backend.stop.
+// Fire-and-forget publishers never see it; old workers (plain Subscribe)
+// never send it and the requester times out — degrading to fire-and-forget.
+type BackendStopReply struct {
+	Success bool   `json:"success"`
+	Error   string `json:"error,omitempty"`
+}
+
 // SubjectNodeBackendDelete tells a worker node to delete a backend (stop + remove files).
 // Uses NATS request-reply.
 func SubjectNodeBackendDelete(nodeID string) string {

@@ -15,11 +15,6 @@ import (
 	"github.com/mudler/xlog"
 )
 
-// backendStopRequest is the request payload for backend.stop (fire-and-forget).
-type backendStopRequest struct {
-	Backend string `json:"backend"`
-}
-
 // NodeCommandSender abstracts NATS-based commands to worker nodes.
 // Used by HTTP endpoint handlers to avoid coupling to the concrete RemoteUnloaderAdapter.
 //
@@ -255,10 +250,7 @@ func (a *RemoteUnloaderAdapter) StopBackend(nodeID, backend string) error {
 	if backend == "" {
 		return a.nats.Publish(subject, nil)
 	}
-	req := struct {
-		Backend string `json:"backend"`
-	}{Backend: backend}
-	return a.nats.Publish(subject, req)
+	return a.nats.Publish(subject, messaging.BackendStopRequest{Backend: backend})
 }
 
 // DeleteBackend tells a worker node to delete a backend (stop + remove files).
