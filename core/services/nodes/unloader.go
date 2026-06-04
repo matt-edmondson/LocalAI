@@ -15,11 +15,6 @@ import (
 	"github.com/mudler/xlog"
 )
 
-// backendStopRequest is the request payload for backend.stop (fire-and-forget).
-type backendStopRequest struct {
-	Backend string `json:"backend"`
-}
-
 // NodeCommandSender abstracts NATS-based commands to worker nodes.
 // Used by HTTP endpoint handlers to avoid coupling to the concrete RemoteUnloaderAdapter.
 //
@@ -39,6 +34,14 @@ type NodeCommandSender interface {
 	DeleteBackend(nodeID, backendName string) (*messaging.BackendDeleteReply, error)
 	ListBackends(nodeID string) (*messaging.BackendListReply, error)
 	StopBackend(nodeID, backend string) error
+	// StopBackendAndWait stops a backend process on a node and waits for the
+	// worker's ack, so the caller can hold a coalescing lock until the
+	// process is confirmed dead. backend should be the exact processKey
+	// (`modelID#replica`) — a bare model ID prefix-matches every replica on
+	// the worker. Old workers execute the stop but never ack; the call then
+	// returns a timeout error and the caller should degrade to
+	// fire-and-forget semantics (log and continue).
+	StopBackendAndWait(nodeID, backend string) error
 	UnloadModelOnNode(nodeID, modelName string) error
 }
 
@@ -255,10 +258,31 @@ func (a *RemoteUnloaderAdapter) StopBackend(nodeID, backend string) error {
 	if backend == "" {
 		return a.nats.Publish(subject, nil)
 	}
-	req := struct {
-		Backend string `json:"backend"`
-	}{Backend: backend}
-	return a.nats.Publish(subject, req)
+	return a.nats.Publish(subject, messaging.BackendStopRequest{Backend: backend})
+}
+
+// backendStopAckTimeout bounds the synchronous backend.stop request-reply:
+// the worker's bounded Free() (10s) + proc.Stop's SIGTERM grace before SIGKILL
+// (up to 15s, go-processmanager default) + NATS delivery.
+const backendStopAckTimeout = 30 * time.Second
+
+// StopBackendAndWait tells a worker to stop a backend process and waits for
+// the ack. Same subject and payload as StopBackend; only the delivery mode
+// differs. Used by the abandoned-load cleanup, which must not release the
+// model-load advisory lock while the doomed process is still alive.
+func (a *RemoteUnloaderAdapter) StopBackendAndWait(nodeID, backend string) error {
+	subject := messaging.SubjectNodeBackendStop(nodeID)
+	xlog.Info("Sending NATS backend.stop (acked)", "nodeID", nodeID, "backend", backend)
+
+	reply, err := messaging.RequestJSON[messaging.BackendStopRequest, messaging.BackendStopReply](
+		a.nats, subject, messaging.BackendStopRequest{Backend: backend}, backendStopAckTimeout)
+	if err != nil {
+		return err
+	}
+	if !reply.Success {
+		return fmt.Errorf("backend.stop on node %s: %s", nodeID, reply.Error)
+	}
+	return nil
 }
 
 // DeleteBackend tells a worker node to delete a backend (stop + remove files).

@@ -284,6 +284,77 @@ func (r *SmartRouter) bumpEstimateOnLoadFailure(ctx context.Context, modelName, 
 	}
 }
 
+// abandonedCleanupTimeout bounds the registry calls made while cleaning up
+// an abandoned load (the acked stop carries its own 30s NATS deadline).
+const abandonedCleanupTimeout = 45 * time.Second
+
+// cleanupAbandonedLoad kills the worker-side backend process for a load that
+// was abandoned after the process was spawned — staging failure, LoadModel
+// timeout / caller disconnect / transport error, or backend-reported failure
+// — and rolls back the per-GPU soft reservations. Without this the worker
+// keeps loading: it completes invisibly, holds RAM/VRAM with no NodeModel
+// row, and both the stale-replica reaper and per-GPU accounting are blind to
+// it (2026-06-03 incident: OOMKilled worker + 7.1GB orphan on GPU0).
+//
+// Runs on a fresh context: the request ctx is typically already cancelled
+// (timeout / disconnect) — that is the point. The stop is synchronous
+// (acked): Route holds the model-load advisory lock through this call, so a
+// queued request for the same model cannot re-install until the process is
+// confirmed dead. Best-effort throughout: failures are logged, never
+// propagated — the load error already on its way to the caller stays the
+// authoritative outcome.
+func (r *SmartRouter) cleanupAbandonedLoad(p *placement, trackingKey string) {
+	ctx, cancel := context.WithTimeout(context.Background(), abandonedCleanupTimeout)
+	defer cancel()
+
+	processKey := fmt.Sprintf("%s#%d", trackingKey, p.replicaIndex)
+
+	// Coalescing guard: the reconciler's ScheduleAndLoadModel runs without
+	// the advisory lock, so a racing load of the same (node, model, replica)
+	// may have already succeeded and registered. Killing now would take down
+	// a live replica — skip the kill, keep the reservation rollback.
+	// LoadedReplicaStats only sees healthy nodes, so a row on a node that
+	// has since gone unhealthy does not block the kill — intentional: an
+	// unhealthy node is not serving traffic, and orphan cleanup wins.
+	kill := true
+	if stats, err := r.registry.LoadedReplicaStats(ctx, trackingKey, []string{p.node.ID}); err == nil {
+		for _, s := range stats {
+			if s.NodeID == p.node.ID && s.ReplicaIndex == p.replicaIndex {
+				kill = false
+				break
+			}
+		}
+	}
+
+	switch {
+	case !kill:
+		xlog.Info("Abandoned-load cleanup: replica registered as loaded by a concurrent request, skipping kill",
+			"node", p.node.Name, "processKey", processKey)
+	case r.unloader == nil:
+		// Non-distributed configuration — nothing to send the stop through.
+	default:
+		xlog.Info("Abandoned-load cleanup: stopping worker-side backend process",
+			"node", p.node.Name, "processKey", processKey)
+		if err := r.unloader.StopBackendAndWait(p.node.ID, processKey); err != nil {
+			// Old workers execute the stop but never ack (timeout); real
+			// failures surface on the next placement attempt anyway.
+			xlog.Warn("Abandoned-load cleanup: stop not acked",
+				"node", p.node.Name, "processKey", processKey, "error", err)
+		}
+	}
+
+	// Roll back the per-GPU soft reservations. Underflow-guarded in the
+	// registry and reset by the worker's next heartbeat regardless, so this
+	// only matters for failures inside the first heartbeat window — but it
+	// keeps the columns accurate, symmetric with the install-failure rollback.
+	for _, gi := range p.reservedGPUs {
+		if err := r.registry.ReleaseVRAMOnGPU(ctx, p.node.ID, gi, p.perGPUReserve); err != nil {
+			xlog.Debug("Abandoned-load cleanup: reservation release failed",
+				"node", p.node.ID, "gpu", gi, "bytes", p.perGPUReserve, "error", err)
+		}
+	}
+}
+
 // scheduleAndLoad is the shared core for loading a model on a new node.
 // Used by both Route() (for first-time loads) and ScheduleAndLoadModel() (for reconciler scale-ups).
 //
@@ -294,10 +365,24 @@ func (r *SmartRouter) bumpEstimateOnLoadFailure(ctx context.Context, modelName, 
 func (r *SmartRouter) scheduleAndLoad(ctx context.Context, backendType, trackingKey, modelName string,
 	modelOpts *pb.ModelOptions, parallel bool, initialInFlight int) (*scheduleLoadResult, error) {
 
-	node, backendAddr, replicaIndex, gpuSet, err := r.scheduleNewModel(ctx, backendType, trackingKey, modelOpts)
+	p, err := r.scheduleNewModel(ctx, backendType, trackingKey, modelOpts)
 	if err != nil {
 		return nil, fmt.Errorf("no available nodes: %w", err)
 	}
+	node, backendAddr, replicaIndex, gpuSet := p.node, p.addr, p.replicaIndex, p.gpuSet
+
+	// The worker-side process exists from here on (installBackendOnNode ran
+	// inside scheduleNewModel). If the load is abandoned on any failure path
+	// below — staging error, LoadModel timeout/disconnect/error, or
+	// backend-reported failure — kill that process and roll back the
+	// reservations; otherwise it keeps loading invisibly with no registry
+	// row (2026-06-03 incident).
+	committed := false
+	defer func() {
+		if !committed {
+			r.cleanupAbandonedLoad(p, trackingKey)
+		}
+	}()
 
 	// Task 4.1: capture pre-load free VRAM snapshot and track this in-flight load
 	// for clean attribution of the post-load delta.
@@ -362,6 +447,10 @@ func (r *SmartRouter) scheduleAndLoad(ctx context.Context, backendType, tracking
 			return nil, fmt.Errorf("loading model %s on node %s: %s", modelName, node.Name, res.Message)
 		}
 	}
+
+	// Load committed: every path past here leaves a live, registered (or at
+	// worst registry-lagging) replica that the normal unload paths own.
+	committed = true
 
 	// Record the model as loaded on this node (specific replica slot), stamping
 	// the assigned physical GPU indices so observability and reconciliation can
@@ -871,6 +960,24 @@ func applyGPUSet(opts *pb.ModelOptions, k int) {
 	}
 }
 
+// placement is scheduleNewModel's result: where a new model load goes and
+// what bookkeeping it holds. reservedGPUs/perGPUReserve record the per-GPU
+// soft reservations taken at scheduling time so post-install failure paths
+// (abandoned loads) can roll them back explicitly instead of waiting for
+// the next worker heartbeat to reset them.
+type placement struct {
+	node         *BackendNode
+	addr         string
+	replicaIndex int
+	// gpuSet is the set of physical GPU indices the model was pinned to
+	// (empty for legacy/CPU placement).
+	gpuSet []int
+	// reservedGPUs are the GPU indices where ReserveVRAMOnGPU succeeded;
+	// perGPUReserve is the bytes reserved on each.
+	reservedGPUs  []int
+	perGPUReserve uint64
+}
+
 // scheduleNewModel picks the best node for loading a new model and allocates
 // the replica slot.
 // Strategy: filter to nodes with a free slot for this model → per-GPU placement
@@ -879,12 +986,13 @@ func applyGPUSet(opts *pb.ModelOptions, k int) {
 // mixed-version clusters where no node has reported per-GPU data yet.
 // Sends backend.install via NATS so the chosen node has the right backend running.
 //
-// Returns (node, gRPC address, replicaIndex, gpuSet, err). replicaIndex is the
-// slot the worker has been told to use; the caller must pass the same index
-// into SetNodeModel so the registry row matches the live process. gpuSet is the
+// Returns a placement carrying the chosen node, gRPC address, replicaIndex,
+// gpuSet, and the per-GPU soft reservations. replicaIndex is the slot the
+// worker has been told to use; the caller must pass the same index into
+// SetNodeModel so the registry row matches the live process. gpuSet is the
 // set of physical GPU indices the model was pinned to (empty when no per-GPU
 // data was available, i.e. legacy/CPU placement).
-func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID string, modelOpts *pb.ModelOptions) (*BackendNode, string, int, []int, error) {
+func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID string, modelOpts *pb.ModelOptions) (*placement, error) {
 	// Estimate VRAM required for the model
 	var estimatedVRAM uint64
 	if modelOpts != nil {
@@ -897,7 +1005,7 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 	sched, _ := r.registry.GetModelScheduling(ctx, modelID)
 	candidateNodeIDs, err := r.resolveSelectorCandidates(ctx, modelID, sched)
 	if err != nil {
-		return nil, "", 0, nil, err
+		return nil, err
 	}
 
 	// Apply concurrency-group anti-affinity (#9659): prefer nodes that don't
@@ -906,7 +1014,7 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 	// per-node watchdog evicts on arrival.
 	candidateNodeIDs, err = r.narrowByGroupAntiAffinity(ctx, modelID, candidateNodeIDs)
 	if err != nil {
-		return nil, "", 0, nil, err
+		return nil, err
 	}
 
 	// Narrow candidates to nodes that still have a free replica slot for this
@@ -1033,14 +1141,14 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 			evictedNode, evictErr := r.evictLRUAndFreeNode(ctx)
 			if evictErr != nil {
 				if !errors.Is(evictErr, ErrEvictionBusy) {
-					return nil, "", 0, nil, fmt.Errorf("no healthy nodes available and eviction failed: %w", evictErr)
+					return nil, fmt.Errorf("no healthy nodes available and eviction failed: %w", evictErr)
 				}
 				// Busy — wait briefly and try again. Honour context cancellation.
 				select {
 				case <-time.After(evictionBusyDelay):
 					continue
 				case <-ctx.Done():
-					return nil, "", 0, nil, fmt.Errorf("eviction interrupted: %w", ctx.Err())
+					return nil, fmt.Errorf("eviction interrupted: %w", ctx.Err())
 				}
 			}
 
@@ -1080,7 +1188,7 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 				select {
 				case <-time.After(postEvictPollDelay):
 				case <-ctx.Done():
-					return nil, "", 0, nil, fmt.Errorf("eviction VRAM-recheck interrupted: %w", ctx.Err())
+					return nil, fmt.Errorf("eviction VRAM-recheck interrupted: %w", ctx.Err())
 				}
 			}
 			if fits {
@@ -1100,7 +1208,7 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 				// Return immediately so the caller never starts a retry loop that
 				// would OOM the worker: the model needs more VRAM than the cluster
 				// can provide on any GPU set.
-				return nil, "", 0, nil, fmt.Errorf(
+				return nil, fmt.Errorf(
 					"model %s needs ~%s, more VRAM than any GPU set on any node can provide",
 					modelID, vram.FormatBytes(estimatedVRAM))
 			}
@@ -1122,7 +1230,7 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 				}
 			}
 			if node == nil {
-				return nil, "", 0, nil, fmt.Errorf("no healthy node available for model %s", modelID)
+				return nil, fmt.Errorf("no healthy node available for model %s", modelID)
 			}
 			// gpuSet stays empty: no CUDA_VISIBLE_DEVICES pin (pre-feature behavior).
 		}
@@ -1144,12 +1252,12 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 			"node", node.Name, "model", modelID, "max_slots", maxSlots)
 		evictedNode, evictErr := r.evictLRUAndFreeNode(ctx)
 		if evictErr != nil {
-			return nil, "", 0, nil, fmt.Errorf("no replica slot on %s and eviction failed: %w", node.Name, evictErr)
+			return nil, fmt.Errorf("no replica slot on %s and eviction failed: %w", node.Name, evictErr)
 		}
 		node = evictedNode
 		replicaIdx, slotErr = r.registry.NextFreeReplicaIndex(ctx, node.ID, modelID, node.MaxReplicasPerModel)
 		if slotErr != nil {
-			return nil, "", 0, nil, fmt.Errorf("no replica slot on %s after eviction: %w", node.Name, slotErr)
+			return nil, fmt.Errorf("no replica slot on %s after eviction: %w", node.Name, slotErr)
 		}
 		// We moved to a different node; the GPU set planned for the previous
 		// node no longer applies. Re-plan against the freed node's per-GPU data
@@ -1199,10 +1307,17 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 		for _, gi := range reservedGPUs {
 			_ = r.registry.ReleaseVRAMOnGPU(ctx, node.ID, gi, perGPUReserve)
 		}
-		return nil, "", 0, nil, fmt.Errorf("installing backend on node %s: %w", node.Name, installErr)
+		return nil, fmt.Errorf("installing backend on node %s: %w", node.Name, installErr)
 	}
 
-	return node, addr, replicaIdx, gpuSet, nil
+	return &placement{
+		node:          node,
+		addr:          addr,
+		replicaIndex:  replicaIdx,
+		gpuSet:        gpuSet,
+		reservedGPUs:  reservedGPUs,
+		perGPUReserve: perGPUReserve,
+	}, nil
 }
 
 // estimateModelVRAM estimates the VRAM required for a model using the unified estimator.

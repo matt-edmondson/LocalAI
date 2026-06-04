@@ -536,6 +536,21 @@ var _ = Describe("NodeRegistry", func() {
 			Expect(stats[0].NodeID).To(Equal(n2.ID))
 		})
 
+		It("returns the replica index for each loaded replica", func() {
+			// A second replica of the same model on n2, slot 1.
+			Expect(registry.SetNodeModel(context.Background(), n2.ID, "stats-model", 1, "loaded", "10.0.0.81:6001", 0, "")).To(Succeed())
+
+			stats, err := registry.LoadedReplicaStats(context.Background(), "stats-model", []string{n2.ID})
+			Expect(err).ToNot(HaveOccurred())
+
+			indices := []int{}
+			for _, s := range stats {
+				indices = append(indices, s.ReplicaIndex)
+			}
+			Expect(indices).To(ConsistOf(0, 1),
+				"LoadedReplicaStats must surface replica_index — prefix-cache keys and abandoned-load cleanup both depend on it")
+		})
+
 		It("excludes unhealthy nodes", func() {
 			Expect(registry.MarkUnhealthy(context.Background(), n1.ID)).To(Succeed())
 			stats, err := registry.LoadedReplicaStats(context.Background(), "stats-model", nil)

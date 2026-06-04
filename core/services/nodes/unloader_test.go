@@ -314,6 +314,39 @@ var _ = Describe("RemoteUnloaderAdapter NATS timeout handling", func() {
 	})
 })
 
+var _ = Describe("RemoteUnloaderAdapter StopBackendAndWait", func() {
+	It("sends an acked backend.stop request with the exact process key", func() {
+		mc := newScriptedMessagingClient()
+		mc.scriptReply(messaging.SubjectNodeBackendStop("n1"), messaging.BackendStopReply{Success: true})
+		adapter := NewRemoteUnloaderAdapter(nil, mc, time.Second, time.Second)
+
+		Expect(adapter.StopBackendAndWait("n1", "my-model#0")).To(Succeed())
+
+		Expect(mc.calls).To(HaveLen(1))
+		Expect(mc.calls[0].Subject).To(Equal(messaging.SubjectNodeBackendStop("n1")))
+		Expect(mc.calls[0].Timeout).To(Equal(30 * time.Second))
+		var req messaging.BackendStopRequest
+		Expect(json.Unmarshal(mc.calls[0].Data, &req)).To(Succeed())
+		Expect(req.Backend).To(Equal("my-model#0"))
+	})
+
+	It("surfaces a worker-reported failure", func() {
+		mc := newScriptedMessagingClient()
+		mc.scriptReply(messaging.SubjectNodeBackendStop("n1"), messaging.BackendStopReply{Success: false, Error: "kill failed"})
+		adapter := NewRemoteUnloaderAdapter(nil, mc, time.Second, time.Second)
+
+		Expect(adapter.StopBackendAndWait("n1", "m#0")).To(MatchError(ContainSubstring("kill failed")))
+	})
+
+	It("returns the timeout error when an old worker never acks", func() {
+		mc := newScriptedMessagingClient()
+		mc.scriptErr(messaging.SubjectNodeBackendStop("n1"), nats.ErrTimeout)
+		adapter := NewRemoteUnloaderAdapter(nil, mc, time.Second, time.Second)
+
+		Expect(adapter.StopBackendAndWait("n1", "m#0")).To(HaveOccurred())
+	})
+})
+
 var _ = Describe("RemoteUnloaderAdapter install progress streaming", func() {
 	It("forwards BackendInstallProgressEvent values into the onProgress callback when the worker publishes them", func() {
 		mc := newScriptedMessagingClient()

@@ -159,6 +159,14 @@ type fakeModelRouter struct {
 	// lastEstimateKey captures the model name argument passed to the most
 	// recent GetModelVRAMEstimate call. Protected by mu.
 	lastEstimateKey string
+
+	// nextFreeReplica is returned by NextFreeReplicaIndex (default 0).
+	nextFreeReplica int
+
+	// reserveGPUCalls / releaseGPUCalls record per-GPU soft reservation
+	// traffic as "nodeID:gpuIndex:bytes" for cleanup assertions.
+	reserveGPUCalls []string
+	releaseGPUCalls []string
 }
 
 func (f *fakeModelRouter) FindAndLockNodeWithModel(_ context.Context, modelName string, _ []string, pref *RoutePreference) (*BackendNode, *NodeModel, error) {
@@ -218,7 +226,7 @@ func (f *fakeModelRouter) GetModelLoadInfo(_ context.Context, _ string) (string,
 }
 
 func (f *fakeModelRouter) NextFreeReplicaIndex(_ context.Context, _, _ string, _ int) (int, error) {
-	return 0, nil
+	return f.nextFreeReplica, nil
 }
 
 func (f *fakeModelRouter) CountReplicasOnNode(_ context.Context, _, _ string) (int, error) {
@@ -340,11 +348,17 @@ func (f *fakeModelRouter) NodeGPUs(_ context.Context, _ string) ([]NodeGPU, erro
 	return f.nodeGPUs, f.nodeGPUsErr
 }
 
-func (f *fakeModelRouter) ReserveVRAMOnGPU(_ context.Context, _ string, _ int, _ uint64) error {
+func (f *fakeModelRouter) ReserveVRAMOnGPU(_ context.Context, nodeID string, gpuIndex int, bytes uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reserveGPUCalls = append(f.reserveGPUCalls, fmt.Sprintf("%s:%d:%d", nodeID, gpuIndex, bytes))
 	return nil
 }
 
-func (f *fakeModelRouter) ReleaseVRAMOnGPU(_ context.Context, _ string, _ int, _ uint64) error {
+func (f *fakeModelRouter) ReleaseVRAMOnGPU(_ context.Context, nodeID string, gpuIndex int, bytes uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releaseGPUCalls = append(f.releaseGPUCalls, fmt.Sprintf("%s:%d:%d", nodeID, gpuIndex, bytes))
 	return nil
 }
 
@@ -415,10 +429,12 @@ type fakeUnloader struct {
 	upgradeErr   error
 	upgradeCalls []upgradeCall // every UpgradeBackend invocation, in order
 
-	stopCalls   []string // "nodeID:model"
-	stopErr     error
-	unloadCalls []string
-	unloadErr   error
+	stopCalls        []string // "nodeID:model"
+	stopErr          error
+	stopAndWaitCalls []string // "nodeID:processKey"
+	stopAndWaitErr   error
+	unloadCalls      []string
+	unloadErr        error
 
 	// lastInstallGPUIndices captures the GPU indices the scheduler pinned on
 	// the most recent InstallBackend call (Task 3.4).
@@ -474,6 +490,13 @@ func (f *fakeUnloader) ListBackends(_ string) (*messaging.BackendListReply, erro
 func (f *fakeUnloader) StopBackend(nodeID, backend string) error {
 	f.stopCalls = append(f.stopCalls, nodeID+":"+backend)
 	return f.stopErr
+}
+
+func (f *fakeUnloader) StopBackendAndWait(nodeID, backend string) error {
+	f.mu.Lock()
+	f.stopAndWaitCalls = append(f.stopAndWaitCalls, nodeID+":"+backend)
+	f.mu.Unlock()
+	return f.stopAndWaitErr
 }
 
 func (f *fakeUnloader) UnloadModelOnNode(nodeID, modelName string) error {
@@ -738,10 +761,10 @@ var _ = Describe("SmartRouter", func() {
 				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
 			})
 
-			gotNode, _, _, gpuSet, err := router.scheduleNewModel(context.Background(), "diffusers", "m", &pb.ModelOptions{Model: "m"})
+			p, err := router.scheduleNewModel(context.Background(), "diffusers", "m", &pb.ModelOptions{Model: "m"})
 			Expect(err).ToNot(HaveOccurred())
-			Expect(gotNode.ID).To(Equal("n"))
-			Expect(gpuSet).To(Equal([]int{1}))
+			Expect(p.node.ID).To(Equal("n"))
+			Expect(p.gpuSet).To(Equal([]int{1}))
 			// The pinned index must reach the worker via backend.install.
 			Expect(unloader.lastInstallGPUIndices).To(Equal([]int{1}))
 		})
@@ -768,7 +791,7 @@ var _ = Describe("SmartRouter", func() {
 				// DB intentionally nil: evictLRUAndFreeNode returns ErrEvictionBusy.
 			})
 
-			_, _, _, _, err := router.scheduleNewModel(context.Background(), "diffusers", "big", &pb.ModelOptions{Model: "big"})
+			_, err := router.scheduleNewModel(context.Background(), "diffusers", "big", &pb.ModelOptions{Model: "big"})
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("more VRAM than any GPU set"))
 		})
@@ -795,10 +818,10 @@ var _ = Describe("SmartRouter", func() {
 				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
 			})
 
-			gotNode, _, _, gpuSet, err := router.scheduleNewModel(context.Background(), "diffusers", "unknown-size", &pb.ModelOptions{Model: "unknown-size"})
+			p, err := router.scheduleNewModel(context.Background(), "diffusers", "unknown-size", &pb.ModelOptions{Model: "unknown-size"})
 			Expect(err).ToNot(HaveOccurred())
-			Expect(gotNode.ID).To(Equal("legacy"))
-			Expect(gpuSet).To(BeEmpty(), "legacy fallback must not pin a GPU (no estimate available)")
+			Expect(p.node.ID).To(Equal("legacy"))
+			Expect(p.gpuSet).To(BeEmpty(), "legacy fallback must not pin a GPU (no estimate available)")
 		})
 
 		// Task 4.1: after a successful load, the VRAM footprint is measured and cached.
@@ -886,11 +909,11 @@ var _ = Describe("SmartRouter", func() {
 				ClientFactory: &stubClientFactory{client: &stubBackend{loadResult: &pb.Result{Success: true}}},
 			})
 
-			gotNode, _, _, gpuSet, err := router.scheduleNewModel(context.Background(), "diffusers", "big-diffuser", &pb.ModelOptions{Model: "big-diffuser"})
+			p, err := router.scheduleNewModel(context.Background(), "diffusers", "big-diffuser", &pb.ModelOptions{Model: "big-diffuser"})
 			Expect(err).ToNot(HaveOccurred())
-			Expect(gotNode.ID).To(Equal("noctis"))
+			Expect(p.node.ID).To(Equal("noctis"))
 			// Both GPUs must be selected (sorted ascending: [0,1]).
-			Expect(gpuSet).To(Equal([]int{0, 1}))
+			Expect(p.gpuSet).To(Equal([]int{0, 1}))
 			// The pinned indices must reach the worker via backend.install.
 			Expect(unloader.lastInstallGPUIndices).To(Equal([]int{0, 1}))
 
@@ -898,7 +921,7 @@ var _ = Describe("SmartRouter", func() {
 			// (applyGPUSet is called in the load path on a cloned ModelOptions, not inside
 			// scheduleNewModel itself; we unit-assert it here to pin the TensorSplit behaviour.)
 			splitOpts := &pb.ModelOptions{}
-			applyGPUSet(splitOpts, len(gpuSet))
+			applyGPUSet(splitOpts, len(p.gpuSet))
 			Expect(splitOpts.TensorParallelSize).To(Equal(int32(2)))
 			Expect(splitOpts.TensorSplit).To(Equal("1,1"))
 		})
