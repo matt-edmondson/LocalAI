@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1476,6 +1477,17 @@ func (r *SmartRouter) stageModelFiles(ctx context.Context, node *BackendNode, op
 
 	xlog.Info("Staging model files for remote node", "node", node.Name, "modelFile", opts.ModelFile, "trackingKey", trackingKey)
 
+	// Local model directory, captured before the ModelFile field is rewritten to
+	// its remote path below. Companion assets declared as option paths (e.g.
+	// sherpa-onnx's tokens.txt / espeak-ng-data) live beside the model, so option
+	// values are resolved relative to this dir as well as frontendModelsDir —
+	// letting a shared config declare them with bare names regardless of whether
+	// Model includes a subdirectory.
+	localModelDir := ""
+	if opts.ModelFile != "" {
+		localModelDir = filepath.Dir(opts.ModelFile)
+	}
+
 	// keyMapper generates storage keys namespaced under trackingKey, preserving
 	// subdirectory structure relative to frontendModelsDir. This ensures:
 	// 1. All files for a model land in one directory on the worker for clean deletion
@@ -1501,13 +1513,12 @@ func (r *SmartRouter) stageModelFiles(ctx context.Context, node *BackendNode, op
 		{"AudioPath", &opts.AudioPath},
 	}
 
-	// Count stageable files for progress tracking
+	// Count stageable files for progress tracking. Directory models expand to
+	// the number of files they contain, matching what stageDirectory uploads.
 	totalFiles := 0
 	for _, f := range fields {
 		if *f.val != "" {
-			if _, err := os.Stat(*f.val); err == nil {
-				totalFiles++
-			}
+			totalFiles += countStageableFiles(*f.val)
 		}
 	}
 	for _, adapter := range opts.LoraAdapters {
@@ -1538,8 +1549,33 @@ func (r *SmartRouter) stageModelFiles(ctx context.Context, node *BackendNode, op
 			*f.val = ""
 			continue
 		}
-		fileIdx++
 		localPath := *f.val
+
+		// Directory models (e.g. qwen3-tts-cpp ships its weights and tokenizer
+		// ggufs under one directory) can't be uploaded as a single file — the
+		// stager would open the directory and read its fd, failing with
+		// "is a directory" (EISDIR). Expand the directory and stage each
+		// contained file, then rewrite the field to the remote directory.
+		if fi, statErr := os.Stat(localPath); statErr == nil && fi.IsDir() {
+			remoteDir, dirErr := r.stageDirectory(ctx, node, trackingKey, localPath, keyMapper, &fileIdx, totalFiles)
+			if dirErr != nil {
+				if f.name == "ModelFile" {
+					xlog.Error("Failed to stage model directory for remote node", "node", node.Name, "field", f.name, "path", localPath, "error", dirErr)
+					return nil, fmt.Errorf("staging model file: %w", dirErr)
+				}
+				xlog.Warn("Failed to stage model directory, clearing field", "field", f.name, "path", localPath, "error", dirErr)
+				*f.val = ""
+				continue
+			}
+			*f.val = remoteDir
+			if f.name == "ModelFile" && opts.Model != "" {
+				opts.ModelPath = DeriveRemoteModelPath(remoteDir, opts.Model)
+				xlog.Debug("Derived remote ModelPath", "modelPath", opts.ModelPath)
+			}
+			continue
+		}
+
+		fileIdx++
 		key := keyMapper.Key(localPath)
 
 		// Attach progress callback to context for byte-level tracking
@@ -1623,8 +1659,8 @@ func (r *SmartRouter) stageModelFiles(ctx context.Context, node *BackendNode, op
 
 	// Stage file paths referenced in generic Options (key:value pairs where values
 	// are file paths). Options stay as relative paths — backends resolve them via ModelPath.
-	r.stageGenericOptions(ctx, node, opts.Options, frontendModelsDir, keyMapper.Key)
-	r.stageGenericOptions(ctx, node, opts.Overrides, frontendModelsDir, keyMapper.Key)
+	r.stageGenericOptions(ctx, node, opts.Options, frontendModelsDir, localModelDir, keyMapper.Key)
+	r.stageGenericOptions(ctx, node, opts.Overrides, frontendModelsDir, localModelDir, keyMapper.Key)
 
 	return opts, nil
 }
@@ -1641,6 +1677,77 @@ func (r *SmartRouter) withStagingCallback(ctx context.Context, trackingKey, file
 		}
 		r.stagingTracker.UpdateFile(trackingKey, fn, fileIdx, bytesSent, totalBytes, speed)
 	})
+}
+
+// countStageableFiles returns the number of regular files a model path expands
+// to for staging: 1 for a regular file, the contained file count for a
+// directory, and 0 if the path does not exist.
+func countStageableFiles(path string) int {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	if !fi.IsDir() {
+		return 1
+	}
+	n := 0
+	_ = filepath.WalkDir(path, func(_ string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if !d.IsDir() {
+			n++
+		}
+		return nil
+	})
+	return n
+}
+
+// stageDirectory stages every file under a directory-based model (e.g.
+// qwen3-tts-cpp, whose weights and tokenizer ggufs live in one directory).
+// Each file is uploaded individually with a structure-preserving key; the
+// returned path is the remote directory that contained them, suitable for the
+// backend's ModelFile/ModelPath. fileIdx is advanced per staged file so the
+// staging progress tracker stays accurate.
+func (r *SmartRouter) stageDirectory(ctx context.Context, node *BackendNode, trackingKey, dir string, keyMapper *StagingKeyMapper, fileIdx *int, totalFiles int) (string, error) {
+	var remoteDir string
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		*fileIdx++
+		fileName := filepath.Base(path)
+		stageCtx := r.withStagingCallback(ctx, trackingKey, fileName, *fileIdx, totalFiles)
+		xlog.Info("Staging file", "model", trackingKey, "node", node.Name, "field", "ModelDir", "file", fileName, "fileIndex", *fileIdx, "totalFiles", totalFiles)
+
+		remoteFile, err := r.fileStager.EnsureRemote(stageCtx, node.ID, path, keyMapper.Key(path))
+		if err != nil {
+			return fmt.Errorf("staging %s: %w", path, err)
+		}
+		r.stagingTracker.FileComplete(trackingKey, *fileIdx, totalFiles)
+
+		// Every file under dir shares the same remote parent directory; derive
+		// it from this file's staged path and its path relative to dir.
+		rel, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return relErr
+		}
+		remoteDir = DeriveRemoteModelPath(remoteFile, rel)
+
+		r.stageCompanionFiles(ctx, node, path, keyMapper.Key)
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if remoteDir == "" {
+		return "", fmt.Errorf("model directory %s contains no files", dir)
+	}
+	return remoteDir, nil
 }
 
 // stageCompanionFiles stages known companion files that exist alongside
@@ -1669,34 +1776,84 @@ func (r *SmartRouter) stageCompanionFiles(ctx context.Context, node *BackendNode
 }
 
 // stageGenericOptions iterates key:value option strings and stages any values
-// that resolve to existing files relative to the frontend models directory.
-// Option values are NOT rewritten — backends resolve them via ModelPath.
-// keyFn generates the namespaced storage key for each file path.
-func (r *SmartRouter) stageGenericOptions(ctx context.Context, node *BackendNode, options []string, frontendModelsDir string, keyFn func(string) string) {
+// that resolve to existing files relative to the frontend models directory or
+// the model's own directory. Option values are NOT rewritten — backends resolve
+// them via ModelPath. keyFn generates the namespaced storage key for each file.
+func (r *SmartRouter) stageGenericOptions(ctx context.Context, node *BackendNode, options []string, frontendModelsDir, modelDir string, keyFn func(string) string) {
 	for _, opt := range options {
 		optKey, val, ok := strings.Cut(opt, ":")
 		if !ok || val == "" {
 			continue
 		}
 
-		// Check if value is an existing file path (absolute or relative to frontend models dir)
-		absPath := val
-		if !filepath.IsAbs(val) && frontendModelsDir != "" {
-			absPath = filepath.Join(frontendModelsDir, val)
+		// Resolve the value to an existing path: absolute as-is, otherwise
+		// relative to frontendModelsDir first, then the model's own directory
+		// (where backends like sherpa-onnx keep companion assets such as
+		// tokens.txt and espeak-ng-data).
+		absPath, ok := resolveOptionPath(val, frontendModelsDir, modelDir)
+		if !ok {
+			continue
 		}
-		if _, err := os.Stat(absPath); os.IsNotExist(err) {
+		info, err := os.Stat(absPath)
+		if err != nil {
 			continue
 		}
 
-		// Stage the file to the worker using the namespaced key
+		// A directory option value (e.g. sherpa-onnx's espeak-ng-data) is staged
+		// file-by-file so the whole tree is recreated beside the model on the
+		// worker; a single file is staged directly. Values are never rewritten —
+		// backends resolve relative paths via ModelPath.
+		if err == nil && info.IsDir() {
+			r.stageOptionDir(ctx, node, absPath, keyFn)
+			xlog.Debug("Staged option directory", "option", optKey, "localPath", absPath)
+			continue
+		}
+
 		key := keyFn(absPath)
 		if _, err := r.fileStager.EnsureRemote(ctx, node.ID, absPath, key); err != nil {
 			xlog.Warn("Failed to stage option file, skipping", "option", opt, "path", absPath, "error", err)
 			continue
 		}
-		// Leave option value unchanged — backend resolves relative paths via ModelPath
 		xlog.Debug("Staged option file", "option", optKey, "localPath", absPath)
 	}
+}
+
+// resolveOptionPath finds an existing local path for an option value: an
+// absolute path as-is, otherwise relative to frontendModelsDir, then to the
+// model's own directory. Returns false when none exists.
+func resolveOptionPath(val, frontendModelsDir, modelDir string) (string, bool) {
+	if filepath.IsAbs(val) {
+		if _, err := os.Stat(val); err == nil {
+			return val, true
+		}
+		return "", false
+	}
+	for _, base := range []string{frontendModelsDir, modelDir} {
+		if base == "" {
+			continue
+		}
+		p := filepath.Join(base, val)
+		if _, err := os.Stat(p); err == nil {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// stageOptionDir stages every regular file under an option-declared directory
+// (e.g. sherpa-onnx's espeak-ng-data) using the structure-preserving key, so the
+// tree is recreated beside the model on the worker. Per-file errors are logged
+// and skipped; the option value itself is not rewritten.
+func (r *SmartRouter) stageOptionDir(ctx context.Context, node *BackendNode, dir string, keyFn func(string) string) {
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return nil
+		}
+		if _, err := r.fileStager.EnsureRemote(ctx, node.ID, path, keyFn(path)); err != nil {
+			xlog.Warn("Failed to stage option directory file, skipping", "path", path, "error", err)
+		}
+		return nil
+	})
 }
 
 // probeHealth checks whether a backend process on the given node/addr is alive
